@@ -1,0 +1,26 @@
+# Inference Forge Configuration
+
+# Agent ports (for health checks)
+agents:
+  benchmark:
+    port: 8081
+  profile:
+    port: 8082
+  coordinator:
+    port: 8083
+
+# SME enablement
+smes:
+  - id: scheduling
+    enabled: true
+  - id: quantization
+    enabled: true
+  - id: speculative
+    enabled: true
+  - id: model_parallel
+    enabled: false  # Enable for multi-GPU
+
+# Optimization parameters
+optimization:
+  max_iterations: 10
+  no_improvement_limit: 3
