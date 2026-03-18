@@ -139,7 +139,7 @@ class InferenceEngine:
     
     def __init__(
         self,
-        model_name: str = "gpt2",
+        model_name: str = "microsoft/Phi-3-mini-4k-instruct",
         port: int = 8000,
         data_dir: str = "./data",
         max_iterations: int = 10,
@@ -346,8 +346,8 @@ class InferenceEngine:
         try:
             # Phase 1: BENCHMARK
             if self.baseline_saturation_rate is None:
-                # First iteration: Run sweep to find saturation, then run at saturation for metrics
-                print(f"\n📊 PHASE 1a: Finding saturation point (sweep)...")
+                # First iteration: Run throughput benchmark at fixed rate (512 RPS)
+                print(f"\n📊 PHASE 1a: Running throughput benchmark at 512 RPS...")
                 
                 sweep_task = Task(
                     type="benchmark",
@@ -976,7 +976,7 @@ async def main():
     parser = argparse.ArgumentParser(
         description="Inference Forge - Continuous vLLM Optimization"
     )
-    parser.add_argument("--model", default="gpt2", help="Model to optimize")
+    parser.add_argument("--model", default="microsoft/Phi-3-mini-4k-instruct", help="Model to optimize")
     parser.add_argument("--port", type=int, default=8000, help="vLLM port")
     parser.add_argument("--data-dir", default="./data", help="Data directory")
     parser.add_argument("--max-iterations", type=int, default=10, help="Max iterations")

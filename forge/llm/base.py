@@ -97,7 +97,7 @@ class AnthropicClient(LLMClient):
         "claude-sonnet-4-20250514": 0.95,
         "claude-3-7-sonnet-20250219": 0.92,
         "claude-3-5-sonnet-20241022": 0.88,
-        "claude-3-5-haiku-20241022": 0.85,
+
     }
     
     async def complete(self, prompt: Prompt, deterministic: bool = False) -> LLMResponse:

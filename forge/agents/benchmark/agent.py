@@ -2,7 +2,7 @@
 
 Integrates with existing autotuner scripts:
 - Uses guidellm to run throughput benchmarks (modern CLI format)
-- Runs at fixed rate of 512 RPS for all benchmarks
+- Runs at fixed rate of 128 RPS for all benchmarks
 - Manages vLLM server lifecycle
 """
 
@@ -32,7 +32,7 @@ class BenchmarkAgent(BaseAgent):
     """Agent that runs vLLM benchmarks using GuideLLM.
     
     Throughput-focused approach:
-    - Uses profile=throughput with rate=512 for all benchmarks
+    - Uses profile=throughput with rate=128 for all benchmarks
     - No sweep - runs at fixed high-rate for throughput measurement
     """
     
@@ -77,7 +77,7 @@ class BenchmarkAgent(BaseAgent):
     async def execute(self, task: Task) -> Dict[str, Any]:
         """Execute benchmark task.
         
-        Runs throughput benchmark at fixed rate (512 RPS).
+        Runs throughput benchmark at fixed rate (128 RPS).
         Uses profile=throughput for all benchmark runs.
         
         Note: Detailed profiling is done by ProfilerAgent (Agent 2) 
@@ -168,7 +168,7 @@ class BenchmarkAgent(BaseAgent):
             
             else:
                 # Mode: Throughput benchmark at fixed rate
-                print("📊 Running throughput benchmark at 512 RPS...")
+                print("📊 Running throughput benchmark at 128 RPS...")
                 self.phase = "throughput"
                 await self.log_event("phase_started", task, {"phase": "throughput"})
                 
@@ -185,7 +185,7 @@ class BenchmarkAgent(BaseAgent):
                 
                 await self.log_event("phase_completed", task, {
                     "phase": "throughput",
-                    "rate": 512
+                    "rate": 128
                 })
                 
                 # Build result for handoff to ProfilerAgent
@@ -228,10 +228,10 @@ class BenchmarkAgent(BaseAgent):
                 
                 return {
                     "success": True,
-                    "rate": 512,
+                    "rate": 128,
                     "throughput_result": sweep_result,
                     "result_file": str(result_file),
-                    "message": "Throughput benchmark at 512 RPS complete. Handing off to ProfilerAgent for profiling.",
+                    "message": "Throughput benchmark at 128 RPS complete. Handing off to ProfilerAgent for profiling.",
                 }
             
         finally:
@@ -266,13 +266,13 @@ class BenchmarkAgent(BaseAgent):
             task=task
         )
         
-        # Build guidellm command (modern CLI format) - throughput profile at rate 512
+        # Build guidellm command (modern CLI format) - throughput profile at rate 128
         cmd = [
             "guidellm", "benchmark", "run",
             "--target", f"http://localhost:{port}",
             "--model", model_name,
             "--profile", "throughput",
-            "--rate", "512",
+            "--rate", "128",
             "--data", f"dataset={dataset},prompt_tokens={prompt_tokens},output_tokens={output_tokens}",
             "--request-type", "text_completions",
             "--output-path", str(sweep_file),
@@ -298,9 +298,9 @@ class BenchmarkAgent(BaseAgent):
         
         self.update_progress(50)
         
-        # For throughput profile, just return the fixed rate (512)
+        # For throughput profile, just return the fixed rate (128)
         # No need to find saturation point from sweep results
-        saturation_rate = 512.0
+        saturation_rate = 128.0
         
         self.update_progress(60)
         
@@ -435,13 +435,13 @@ class BenchmarkAgent(BaseAgent):
             task=task
         )
         
-        # Build guidellm command for throughput run at rate 512
+        # Build guidellm command for throughput run at rate 128
         cmd = [
             "guidellm", "benchmark", "run",
             "--target", f"http://localhost:{port}",
             "--model", model_name,
             "--profile", "throughput",
-            "--rate", "512",
+            "--rate", "128",
             "--data", f"dataset={dataset},prompt_tokens={prompt_tokens},output_tokens={output_tokens}",
             "--request-type", "text_completions",
             "--output-path", str(steady_file),

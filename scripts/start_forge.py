@@ -25,7 +25,7 @@ async def main():
     )
     parser.add_argument("--config", default="./config.yaml", help="Path to config file")
     parser.add_argument("--data-dir", default="./data", help="Data directory")
-    parser.add_argument("--model", default="gpt2", help="Model to optimize")
+    parser.add_argument("--model", default="microsoft/Phi-3-mini-4k-instruct", help="Model to optimize")
     parser.add_argument("--port", type=int, default=9995, help="vLLM server port")
     parser.add_argument("--max-iterations", type=int, default=10, help="Maximum iterations")
     parser.add_argument("--no-improvement-limit", type=int, default=3,
