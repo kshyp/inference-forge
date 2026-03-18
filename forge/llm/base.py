@@ -92,13 +92,15 @@ class AnthropicClient(LLMClient):
     
     # Model quality tiers (for consensus weighting)
     MODEL_QUALITY = {
-        "claude-3-7-sonnet-20250219": 1.0,
-        "claude-3-5-sonnet-20241022": 0.95,
+        "claude-opus-4-1-20250805": 1.0,
+        "claude-opus-4-20250514": 0.98,
+        "claude-sonnet-4-20250514": 0.95,
+        "claude-3-7-sonnet-20250219": 0.92,
+        "claude-3-5-sonnet-20241022": 0.88,
         "claude-3-5-haiku-20241022": 0.85,
-        "claude-3-opus-20240229": 1.0,
     }
     
-    async def complete(self, prompt: Prompt) -> LLMResponse:
+    async def complete(self, prompt: Prompt, deterministic: bool = False) -> LLMResponse:
         """Call Claude API."""
         # Lazy import to avoid dependency if not used
         try:
@@ -110,14 +112,22 @@ class AnthropicClient(LLMClient):
         
         start_time = time.time()
         
-        response = await client.messages.create(
-            model=self.model,
-            max_tokens=4096,
-            system=prompt.system,
-            messages=[{"role": "user", "content": prompt.user}],
-            # Request JSON mode if model supports it
-            **self._get_response_format()
-        )
+        # Build request kwargs
+        kwargs = {
+            "model": self.model,
+            "max_tokens": 4096,
+            "system": prompt.system,
+            "messages": [{"role": "user", "content": prompt.user}],
+        }
+        
+        # Use temperature=0 for deterministic results
+        if deterministic:
+            kwargs["temperature"] = 0.0
+        
+        # Add response format parameters
+        kwargs.update(self._get_response_format())
+        
+        response = await client.messages.create(**kwargs)
         
         latency_ms = (time.time() - start_time) * 1000
         

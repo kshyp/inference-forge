@@ -1,6 +1,6 @@
 """Benchmark Runner Agent (Agent 1).
 
-Finds saturation point via GuideLLM sweep.
+Runs throughput benchmarks using GuideLLM at fixed rate (512 RPS).
 """
 
 from .agent import BenchmarkAgent

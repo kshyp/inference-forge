@@ -1,8 +1,8 @@
 """Agent 1: Benchmark Runner.
 
 Integrates with existing autotuner scripts:
-- Uses guidellm to find saturation point (modern CLI format)
-- Runs steady-state benchmark at saturation rate
+- Uses guidellm to run throughput benchmarks (modern CLI format)
+- Runs at fixed rate of 512 RPS for all benchmarks
 - Manages vLLM server lifecycle
 """
 
@@ -31,9 +31,9 @@ from forge.core.state import StateStore
 class BenchmarkAgent(BaseAgent):
     """Agent that runs vLLM benchmarks using GuideLLM.
     
-    Two-phase approach:
-    1. Sweep: Find saturation point (profile=sweep)
-    2. Steady-state: Run at identified rate for stable metrics
+    Throughput-focused approach:
+    - Uses profile=throughput with rate=512 for all benchmarks
+    - No sweep - runs at fixed high-rate for throughput measurement
     """
     
     def __init__(
@@ -77,9 +77,10 @@ class BenchmarkAgent(BaseAgent):
     async def execute(self, task: Task) -> Dict[str, Any]:
         """Execute benchmark task.
         
-        Phase 1 ONLY: Sweep to find saturation point.
+        Runs throughput benchmark at fixed rate (512 RPS).
+        Uses profile=throughput for all benchmark runs.
         
-        Note: Steady-state profiling is done by ProfilerAgent (Agent 2) 
+        Note: Detailed profiling is done by ProfilerAgent (Agent 2) 
         with DEBUG logging and profilers attached (NCU/NSys).
         
         Expected task payload:
@@ -166,25 +167,25 @@ class BenchmarkAgent(BaseAgent):
                 }
             
             else:
-                # Mode: Full sweep to find saturation point
-                print("📊 Running full sweep to find saturation point...")
-                self.phase = "sweep"
-                await self.log_event("phase_started", task, {"phase": "sweep"})
+                # Mode: Throughput benchmark at fixed rate
+                print("📊 Running throughput benchmark at 512 RPS...")
+                self.phase = "throughput"
+                await self.log_event("phase_started", task, {"phase": "throughput"})
                 
-                sweep_file = exp_dir / "sweep_results.json"
+                throughput_file = exp_dir / "throughput_results.json"
                 self.saturation_rate = await self._run_sweep(
                     model_name=model_name,
                     port=port,
-                    sweep_file=sweep_file,
+                    sweep_file=throughput_file,
                     guidellm_config=guidellm_config,
                     exp_dir=exp_dir,
                     task=task,
                 )
-                self.sweep_results = sweep_file
+                self.sweep_results = throughput_file
                 
                 await self.log_event("phase_completed", task, {
-                    "phase": "sweep",
-                    "saturation_rate": self.saturation_rate
+                    "phase": "throughput",
+                    "rate": 512
                 })
                 
                 # Build result for handoff to ProfilerAgent
@@ -217,7 +218,7 @@ class BenchmarkAgent(BaseAgent):
                         "cuda_version": hardware.cuda_version,
                     },
                     "vllm_command": f"python -m vllm.entrypoints.openai.api_server --model {model_name} --port {port}",
-                    "guidellm_report_path": str(sweep_file),
+                    "guidellm_report_path": str(throughput_file),
                     "vllm_logs_path": str(exp_dir / "vllm_server.log"),
                 }
                 
@@ -227,10 +228,10 @@ class BenchmarkAgent(BaseAgent):
                 
                 return {
                     "success": True,
-                    "saturation_rate": self.saturation_rate,
-                    "sweep_result": sweep_result,
+                    "rate": 512,
+                    "throughput_result": sweep_result,
                     "result_file": str(result_file),
-                    "message": "Sweep complete. Handing off to ProfilerAgent for steady-state profiling.",
+                    "message": "Throughput benchmark at 512 RPS complete. Handing off to ProfilerAgent for profiling.",
                 }
             
         finally:
@@ -247,9 +248,9 @@ class BenchmarkAgent(BaseAgent):
         exp_dir: Path,
         task: Task,
     ) -> float:
-        """Run GuideLLM sweep to find saturation point.
+        """Run GuideLLM throughput benchmark.
         
-        Uses modern CLI: guidellm benchmark run --profile sweep
+        Uses modern CLI: guidellm benchmark run --profile throughput
         """
         # Construct data config
         dataset = guidellm_config.get("dataset", "wikitext")
@@ -265,13 +266,13 @@ class BenchmarkAgent(BaseAgent):
             task=task
         )
         
-        # Build guidellm command (modern CLI format)
+        # Build guidellm command (modern CLI format) - throughput profile at rate 512
         cmd = [
             "guidellm", "benchmark", "run",
             "--target", f"http://localhost:{port}",
             "--model", model_name,
-            "--profile", "sweep",
-            "--rate", "10",  # Number of benchmark points in sweep
+            "--profile", "throughput",
+            "--rate", "512",
             "--data", f"dataset={dataset},prompt_tokens={prompt_tokens},output_tokens={output_tokens}",
             "--request-type", "text_completions",
             "--output-path", str(sweep_file),
@@ -297,8 +298,9 @@ class BenchmarkAgent(BaseAgent):
         
         self.update_progress(50)
         
-        # Parse sweep results to find saturation point
-        saturation_rate = self._find_saturation_from_sweep(sweep_file)
+        # For throughput profile, just return the fixed rate (512)
+        # No need to find saturation point from sweep results
+        saturation_rate = 512.0
         
         self.update_progress(60)
         
@@ -433,13 +435,13 @@ class BenchmarkAgent(BaseAgent):
             task=task
         )
         
-        # Build guidellm command for steady-state run
+        # Build guidellm command for throughput run at rate 512
         cmd = [
             "guidellm", "benchmark", "run",
             "--target", f"http://localhost:{port}",
             "--model", model_name,
-            "--profile", "constant",
-            "--rate", str(int(rate)),
+            "--profile", "throughput",
+            "--rate", "512",
             "--data", f"dataset={dataset},prompt_tokens={prompt_tokens},output_tokens={output_tokens}",
             "--request-type", "text_completions",
             "--output-path", str(steady_file),

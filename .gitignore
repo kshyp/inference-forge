@@ -38,6 +38,7 @@ data/experiments/
 data/profiles/
 data/*.db
 data/*.json
+scripts/data/
 *.log
 
 # OS
