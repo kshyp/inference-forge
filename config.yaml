@@ -24,3 +24,4 @@ smes:
 optimization:
   max_iterations: 10
   no_improvement_limit: 3
+  force_iterations: false  # Set to true to run all max_iterations regardless of early convergence

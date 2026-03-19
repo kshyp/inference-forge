@@ -202,23 +202,20 @@ class ConsensusEngine:
             
             print(f"      [Consensus] Cluster {i+1}: agreement={cs.agreement_score:.2f}, min_required={effective_min_agreement}")
             
-            # Filter by minimum agreement
+            # Include ALL suggestions, marking whether they meet consensus threshold
+            # The synthesizer will rank them: consensus first, then by confidence
             if cs.agreement_score >= effective_min_agreement:
-                consensus_suggestions.append(cs)
-                print(f"         ✓ ACCEPTED: {cs.config_changes}")
+                print(f"         ✓ CONSENSUS: {cs.config_changes}")
             else:
-                print(f"         ✗ REJECTED (low agreement): {cs.config_changes}")
+                print(f"         → Individual: {cs.config_changes} (conf={cs.weighted_confidence:.2f})")
+            
+            consensus_suggestions.append(cs)
         
-        # FALLBACK: If no suggestions meet agreement threshold, pick best one anyway
-        if not consensus_suggestions and clusters:
-            print(f"      [Consensus] FALLBACK: No clusters met agreement threshold {effective_min_agreement}")
-            print(f"      [Consensus] Picking highest confidence suggestion despite low agreement")
-            # Find cluster with highest weighted confidence
-            best_cluster = max(clusters, 
-                key=lambda c: ConsensusEngine._create_consensus_suggestion(c, total_models, config).weighted_confidence)
-            best_cs = ConsensusEngine._create_consensus_suggestion(best_cluster, total_models, config)
-            consensus_suggestions.append(best_cs)
-            print(f"         → FALLBACK ACCEPTED: {best_cs.config_changes} (agreement={best_cs.agreement_score:.2f}, conf={best_cs.weighted_confidence:.2f})")
+        # NOTE: We no longer filter out low-agreement suggestions.
+        # All suggestions are included and will be ranked by the synthesizer:
+        # - High agreement (consensus) suggestions get priority
+        # - Within same agreement level, higher confidence comes first
+        # This ensures we exhaust all experiments before re-consulting SMEs.
         
         # Step 5: Sort by priority, then by weighted confidence
         consensus_suggestions.sort(

@@ -2,7 +2,7 @@
 
 Integrates with existing autotuner scripts:
 - Uses guidellm to run throughput benchmarks (modern CLI format)
-- Runs at fixed rate of 128 RPS for all benchmarks
+- Runs single benchmark at fixed rate (128 RPS) for baseline
 - Manages vLLM server lifecycle
 """
 
@@ -32,8 +32,9 @@ class BenchmarkAgent(BaseAgent):
     """Agent that runs vLLM benchmarks using GuideLLM.
     
     Throughput-focused approach:
-    - Uses profile=throughput with rate=128 for all benchmarks
-    - No sweep - runs at fixed high-rate for throughput measurement
+    - Uses profile=throughput with rate=128 for baseline measurement
+    - Single benchmark run - no multiple passes
+    - Returns metrics for comparison
     """
     
     def __init__(
@@ -54,10 +55,9 @@ class BenchmarkAgent(BaseAgent):
         self.autotuner_dir = Path(autotuner_dir)
         
         # Runtime state (checkpointed)
-        self.phase: str = "idle"  # idle, sweep, steady_state
-        self.sweep_results: Optional[Path] = None
-        self.saturation_rate: Optional[float] = None
-        self.steady_state_results: Optional[Path] = None
+        self.phase: str = "idle"  # idle, running
+        self.benchmark_results: Optional[Path] = None
+        self.baseline_rate: float = 128.0  # Fixed rate for all benchmarks
         self.vllm_pid: Optional[int] = None
         
         # Task queue
@@ -102,353 +102,117 @@ class BenchmarkAgent(BaseAgent):
         vllm_config = payload.get("vllm_config", {})
         guidellm_config = payload.get("guidellm_config", {})
         
-        # Check if target rate is provided (skip sweep, run single benchmark)
-        target_rate = payload.get("target_rate")
-        
         port = vllm_config.get("port", 8000)
         
-        # Create experiment directory
+        # Create unified experiment directory structure
         exp_dir = self.data_dir / "experiments" / str(experiment_id)
-        exp_dir.mkdir(parents=True, exist_ok=True)
+        benchmark_dir = exp_dir / "benchmark"
+        try:
+            benchmark_dir.mkdir(parents=True, exist_ok=True)
+            print(f"   📁 Created benchmark directory: {benchmark_dir}")
+        except Exception as e:
+            print(f"   ❌ Failed to create benchmark directory: {e}")
+            raise
         
         try:
-            if target_rate:
-                # Mode: Single benchmark at target rate (for comparing configs)
-                print(f"📊 Running single benchmark at target rate: {target_rate:.2f} RPS")
-                self.phase = "single_benchmark"
-                print(f"   Config: max_num_seqs={vllm_config.get('max_num_seqs')}, "
-                      f"max_num_batched_tokens={vllm_config.get('max_num_batched_tokens')}, "
-                      f"enable_chunked_prefill={vllm_config.get('enable_chunked_prefill')}")
-                await self.log_event("phase_started", task, {
-                    "phase": "single_benchmark",
-                    "target_rate": target_rate
-                })
-                
-                steady_file = exp_dir / "benchmark_results.json"
-                result = await self._run_single_benchmark(
-                    model_name=model_name,
-                    port=port,
-                    rate=target_rate,
-                    steady_file=steady_file,
-                    guidellm_config=guidellm_config,
-                    exp_dir=exp_dir,
-                    config_flags=vllm_config,
-                    task=task,
-                )
-                
-                self.saturation_rate = target_rate
-                
-                # Debug: print extracted metrics
-                print(f"   ✓ Benchmark complete: {result.metrics.requests_per_sec:.1f} req/s, "
-                      f"TTFT={result.metrics.ttft_ms.p50:.1f}/{result.metrics.ttft_ms.p95:.1f}/{result.metrics.ttft_ms.p99:.1f}ms, "
-                      f"TPOT={result.metrics.tpot_ms.p50:.1f}/{result.metrics.tpot_ms.p95:.1f}/{result.metrics.tpot_ms.p99:.1f}ms, "
-                      f"Tokens={result.metrics.total_tokens_per_sec:.0f}/{result.metrics.output_tokens_per_sec:.0f}")
-                
-                await self.log_event("phase_completed", task, {
-                    "phase": "single_benchmark",
-                    "metrics": {
-                        "requests_per_sec": result.metrics.requests_per_sec,
-                        "ttft_p99": result.metrics.ttft_ms.p99,
-                        "tpot_p99": result.metrics.tpot_ms.p99,
-                    }
-                })
-                
-                # Save result
-                result_file = exp_dir / "benchmark_result.json"
-                with open(result_file, "w") as f:
-                    json.dump(self._benchmark_result_to_dict(result), f, indent=2)
-                
-                return {
-                    "success": True,
-                    "saturation_rate": target_rate,
-                    "benchmark_result": self._benchmark_result_to_dict(result),
-                    "result_file": str(result_file),
-                    "message": f"Single benchmark at {target_rate:.2f} RPS complete.",
-                }
+            # Run single benchmark at fixed rate
+            print(f"📊 Running benchmark at {self.baseline_rate:.0f} RPS...")
+            self.phase = "benchmark"
+            print(f"   Config: max_num_seqs={vllm_config.get('max_num_seqs')}, "
+                  f"max_num_batched_tokens={vllm_config.get('max_num_batched_tokens')}, "
+                  f"enable_chunked_prefill={vllm_config.get('enable_chunked_prefill')}")
+            await self.log_event("phase_started", task, {
+                "phase": "benchmark",
+                "rate": self.baseline_rate
+            })
             
-            else:
-                # Mode: Throughput benchmark at fixed rate
-                print("📊 Running throughput benchmark at 128 RPS...")
-                self.phase = "throughput"
-                await self.log_event("phase_started", task, {"phase": "throughput"})
-                
-                throughput_file = exp_dir / "throughput_results.json"
-                self.saturation_rate = await self._run_sweep(
-                    model_name=model_name,
-                    port=port,
-                    sweep_file=throughput_file,
-                    guidellm_config=guidellm_config,
-                    exp_dir=exp_dir,
-                    task=task,
-                )
-                self.sweep_results = throughput_file
-                
-                await self.log_event("phase_completed", task, {
-                    "phase": "throughput",
-                    "rate": 128
-                })
-                
-                # Build result for handoff to ProfilerAgent
-                hardware = self._detect_hardware()
-                
-                sweep_result = {
-                    "experiment_id": str(experiment_id),
-                    "config_flags": vllm_config,
-                    "saturation_point": {
-                        "rps": self.saturation_rate,
-                        "latency_ms": 0,
-                        "error_rate": 0.0,
-                        "confidence": "high" if self.saturation_rate > 0 else "low",
-                    },
-                    "metrics": {
-                        "ttft_ms": {"p50": 0, "p95": 0, "p99": 0},
-                        "tpot_ms": {"p50": 0, "p95": 0, "p99": 0},
-                        "output_tokens_per_sec": 0,
-                        "total_tokens_per_sec": 0,
-                        "requests_per_sec": 0,
-                        "duration_seconds": 0,
-                        "total_requests": 0,
-                        "failed_requests": 0,
-                    },
-                    "hardware_info": {
-                        "gpu_count": hardware.gpu_count,
-                        "gpu_type": hardware.gpu_type,
-                        "gpu_memory_gb": hardware.gpu_memory_gb,
-                        "driver_version": hardware.driver_version,
-                        "cuda_version": hardware.cuda_version,
-                    },
-                    "vllm_command": f"python -m vllm.entrypoints.openai.api_server --model {model_name} --port {port}",
-                    "guidellm_report_path": str(throughput_file),
-                    "vllm_logs_path": str(exp_dir / "vllm_server.log"),
-                }
-                
-                result_file = exp_dir / "benchmark_result.json"
-                with open(result_file, "w") as f:
-                    json.dump(sweep_result, f, indent=2)
-                
-                return {
-                    "success": True,
-                    "rate": 128,
-                    "throughput_result": sweep_result,
-                    "result_file": str(result_file),
-                    "message": "Throughput benchmark at 128 RPS complete. Handing off to ProfilerAgent for profiling.",
-                }
+            result_file = benchmark_dir / "results.json"
+            result = await self._run_benchmark(
+                model_name=model_name,
+                port=port,
+                rate=self.baseline_rate,
+                result_file=result_file,
+                guidellm_config=guidellm_config,
+                benchmark_dir=benchmark_dir,
+                config_flags=vllm_config,
+                task=task,
+            )
             
+            self.benchmark_results = result_file
+            
+            # Print extracted metrics
+            print(f"   ✓ Benchmark complete: {result.metrics.requests_per_sec:.1f} req/s, "
+                  f"TTFT={result.metrics.ttft_ms.p50:.1f}/{result.metrics.ttft_ms.p95:.1f}/{result.metrics.ttft_ms.p99:.1f}ms, "
+                  f"TPOT={result.metrics.tpot_ms.p50:.1f}/{result.metrics.tpot_ms.p95:.1f}/{result.metrics.tpot_ms.p99:.1f}ms, "
+                  f"Tokens={result.metrics.total_tokens_per_sec:.0f}/{result.metrics.output_tokens_per_sec:.0f}")
+            
+            await self.log_event("phase_completed", task, {
+                "phase": "benchmark",
+                "metrics": {
+                    "requests_per_sec": result.metrics.requests_per_sec,
+                    "ttft_p99": result.metrics.ttft_ms.p99,
+                    "tpot_p99": result.metrics.tpot_ms.p99,
+                }
+            })
+            
+            # Save result
+            result_dict = self._benchmark_result_to_dict(result)
+            with open(benchmark_dir / "result.json", "w") as f:
+                json.dump(result_dict, f, indent=2)
+            
+            return {
+                "success": True,
+                "baseline_rate": self.baseline_rate,
+                "benchmark_result": result_dict,
+                "result_file": str(result_file),
+                "message": f"Benchmark at {self.baseline_rate:.0f} RPS complete.",
+            }
+        
         finally:
             # Cleanup - stop vLLM
             await self._cleanup_vllm()
             self.phase = "idle"
     
-    async def _run_sweep(
-        self,
-        model_name: str,
-        port: int,
-        sweep_file: Path,
-        guidellm_config: Dict[str, Any],
-        exp_dir: Path,
-        task: Task,
-    ) -> float:
-        """Run GuideLLM throughput benchmark.
-        
-        Uses modern CLI: guidellm benchmark run --profile throughput
-        """
-        # Construct data config
-        dataset = guidellm_config.get("dataset", "wikitext")
-        prompt_tokens = guidellm_config.get("prompt_tokens", 512)
-        output_tokens = guidellm_config.get("output_tokens", 128)
-        max_requests = guidellm_config.get("max_requests", 500)
-        
-        # Start vLLM first
-        await self._start_vllm(
-            model_name=model_name,
-            port=port,
-            exp_dir=exp_dir,
-            task=task
-        )
-        
-        # Build guidellm command (modern CLI format) - throughput profile at rate 128
-        cmd = [
-            "guidellm", "benchmark", "run",
-            "--target", f"http://localhost:{port}",
-            "--model", model_name,
-            "--profile", "throughput",
-            "--rate", "128",
-            "--data", f"dataset={dataset},prompt_tokens={prompt_tokens},output_tokens={output_tokens}",
-            "--request-type", "text_completions",
-            "--output-path", str(sweep_file),
-            "--max-requests", str(max_requests),
-        ]
-        
-        self.update_progress(10)
-        
-        # Run sweep
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        
-        stdout, stderr = await proc.communicate()
-        
-        if proc.returncode != 0:
-            # Log the error for debugging
-            print(f"GuideLLM stdout: {stdout.decode()}")
-            print(f"GuideLLM stderr: {stderr.decode()}")
-            raise RuntimeError(f"Sweep failed: {stderr.decode()}")
-        
-        self.update_progress(50)
-        
-        # For throughput profile, just return the fixed rate (128)
-        # No need to find saturation point from sweep results
-        saturation_rate = 128.0
-        
-        self.update_progress(60)
-        
-        return saturation_rate
-    
-    def _find_saturation_from_sweep(self, sweep_file: Path) -> float:
-        """Parse GuideLLM sweep results to find saturation rate.
-        
-        Looks for the point where latency starts increasing rapidly
-        or throughput plateaus.
-        
-        GuideLLM 0.5.3 format: {"benchmarks": [...], "metadata": ..., "args": ...}
-        Each benchmark has config.strategy.rate and metrics.
-        """
-        if not sweep_file.exists():
-            print(f"Warning: Sweep file not found: {sweep_file}")
-            return 50.0  # Default fallback
-        
-        try:
-            with open(sweep_file) as f:
-                data = json.load(f)
-            
-            # GuideLLM 0.5.3 output format
-            if isinstance(data, dict) and "benchmarks" in data:
-                benchmarks = data["benchmarks"]
-            elif isinstance(data, list):
-                benchmarks = data
-            else:
-                benchmarks = []
-            
-            if not benchmarks:
-                print("Warning: No benchmarks found in sweep results")
-                return 50.0
-            
-            return self._analyze_benchmarks(benchmarks)
-            
-        except Exception as e:
-            print(f"Warning: Could not parse sweep results: {e}")
-            import traceback
-            traceback.print_exc()
-            return 50.0
-    
-    def _analyze_benchmarks(self, benchmarks: List[Dict]) -> float:
-        """Analyze benchmark results to find saturation point.
-        
-        GuideLLM 0.5.3 format:
-        - rate is in config.strategy.rate (for constant profile)
-        - latency is in metrics.request_latency.successful.mean (in seconds)
-        - throughput is in metrics.requests_per_second.successful.mean
-        """
-        if not benchmarks:
-            return 50.0
-        
-        # Extract rate and latency for each benchmark (only constant profile)
-        results = []
-        for b in benchmarks:
-            config = b.get("config", {})
-            strategy = config.get("strategy", {})
-            
-            # Only consider constant rate benchmarks
-            if strategy.get("type_") != "constant":
-                continue
-            
-            rate = strategy.get("rate", 0)
-            
-            metrics = b.get("metrics", {})
-            latency_stats = metrics.get("request_latency", {}).get("successful", {})
-            latency = latency_stats.get("mean", 0)  # In seconds
-            latency_ms = latency * 1000  # Convert to ms
-            
-            throughput_stats = metrics.get("requests_per_second", {}).get("successful", {})
-            throughput = throughput_stats.get("mean", 0)
-            
-            if rate > 0 and latency > 0:
-                results.append({
-                    "rate": float(rate),
-                    "latency_ms": float(latency_ms),
-                    "throughput": float(throughput),
-                })
-        
-        if not results:
-            print("Warning: No valid constant-rate benchmarks found")
-            return 50.0
-        
-        # Sort by rate
-        results.sort(key=lambda x: x["rate"])
-        
-        print(f"Analyzing {len(results)} benchmarks:")
-        for r in results:
-            print(f"  Rate: {r['rate']:.2f}, Latency: {r['latency_ms']:.2f}ms, Throughput: {r['throughput']:.2f}")
-        
-        # Find saturation: where latency increases >2x from previous
-        for i in range(1, len(results)):
-            prev = results[i-1]
-            curr = results[i]
-            
-            if curr["latency_ms"] > prev["latency_ms"] * 2:
-                # Saturation detected
-                print(f"Saturation detected at rate {prev['rate']:.2f} (latency jump: {prev['latency_ms']:.2f}ms -> {curr['latency_ms']:.2f}ms)")
-                return prev["rate"]
-        
-        # No clear saturation - use 80% of max rate
-        max_rate = results[-1]["rate"]
-        saturation = max_rate * 0.8
-        print(f"No clear saturation, using {saturation:.2f} (80% of max {max_rate:.2f})")
-        return saturation
-    
-    async def _run_single_benchmark(
+    async def _run_benchmark(
         self,
         model_name: str,
         rate: float,
         port: int,
-        steady_file: Path,
+        result_file: Path,
         guidellm_config: Dict[str, Any],
-        exp_dir: Path,
+        benchmark_dir: Path,
         config_flags: Dict[str, Any],
         task: Task,
     ) -> BenchmarkResult:
-        """Run steady-state benchmark at saturation rate."""
+        """Run benchmark at specified rate."""
         # Construct data config
         dataset = guidellm_config.get("dataset", "wikitext")
         prompt_tokens = guidellm_config.get("prompt_tokens", 512)
         output_tokens = guidellm_config.get("output_tokens", 128)
         max_requests = guidellm_config.get("max_requests", 1000)
         
-        # Restart vLLM for clean state
-        await self._cleanup_vllm()
+        # Start vLLM
         await self._start_vllm(
             model_name=model_name,
             port=port,
-            exp_dir=exp_dir,
+            benchmark_dir=benchmark_dir,
             task=task
         )
         
-        # Build guidellm command for throughput run at rate 128
+        # Build guidellm command for throughput run
         cmd = [
             "guidellm", "benchmark", "run",
             "--target", f"http://localhost:{port}",
             "--model", model_name,
             "--profile", "throughput",
-            "--rate", "128",
+            "--rate", str(int(rate)),
             "--data", f"dataset={dataset},prompt_tokens={prompt_tokens},output_tokens={output_tokens}",
             "--request-type", "text_completions",
-            "--output-path", str(steady_file),
+            "--output-path", str(result_file),
             "--max-requests", str(max_requests),
         ]
         
-        self.update_progress(70)
+        self.update_progress(50)
         
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -461,15 +225,15 @@ class BenchmarkAgent(BaseAgent):
         if proc.returncode != 0:
             print(f"GuideLLM stdout: {stdout.decode()}")
             print(f"GuideLLM stderr: {stderr.decode()}")
-            raise RuntimeError(f"Steady-state run failed: {stderr.decode()}")
+            raise RuntimeError(f"Benchmark failed: {stderr.decode()}")
         
         self.update_progress(90)
         
         # Parse results
-        metrics = self._parse_steady_state_results(steady_file)
+        metrics = self._parse_benchmark_results(result_file)
         
         # Build result
-        saturation = SaturationPoint(
+        baseline = SaturationPoint(
             rps=rate,
             latency_ms=metrics.ttft_ms.p50,
             error_rate=0.0,
@@ -483,16 +247,16 @@ class BenchmarkAgent(BaseAgent):
         return BenchmarkResult(
             experiment_id=task.payload["experiment_id"],
             config_flags=config_flags,
-            saturation_point=saturation,
+            saturation_point=baseline,
             metrics=metrics,
-            guidellm_report_path=steady_file,
-            vllm_logs_path=exp_dir / "vllm_server.log",
+            guidellm_report_path=result_file,
+            vllm_logs_path=benchmark_dir / "vllm_server.log",
             hardware_info=hardware,
             vllm_command=f"python -m vllm.entrypoints.openai.api_server --model {model_name} --port {port}",
         )
     
-    def _parse_steady_state_results(self, results_file: Path) -> BenchmarkMetrics:
-        """Parse GuideLLM steady-state results.
+    def _parse_benchmark_results(self, results_file: Path) -> BenchmarkMetrics:
+        """Parse GuideLLM benchmark results.
         
         GuideLLM 0.5.3 format:
         - metrics are nested under metrics.*.successful
@@ -603,11 +367,11 @@ class BenchmarkAgent(BaseAgent):
         self,
         model_name: str,
         port: int,
-        exp_dir: Path,
+        benchmark_dir: Path,
         task: Task,
     ) -> None:
         """Start vLLM server."""
-        log_file = exp_dir / "vllm_server.log"
+        log_file = benchmark_dir / "vllm_server.log"
         
         # Check for start script
         start_script = self.autotuner_dir / "start_vllm_server.sh"
@@ -714,9 +478,8 @@ class BenchmarkAgent(BaseAgent):
         """Serialize state for checkpointing."""
         return {
             "phase": self.phase,
-            "saturation_rate": self.saturation_rate,
-            "sweep_results": str(self.sweep_results) if self.sweep_results else None,
-            "steady_state_results": str(self.steady_state_results) if self.steady_state_results else None,
+            "baseline_rate": self.baseline_rate,
+            "benchmark_results": str(self.benchmark_results) if self.benchmark_results else None,
             "vllm_pid": self.vllm_pid,
             "current_progress": self.current_progress,
         }
@@ -724,11 +487,9 @@ class BenchmarkAgent(BaseAgent):
     def restore_from_checkpoint(self, data: Dict[str, Any]) -> None:
         """Restore state from checkpoint."""
         self.phase = data.get("phase", "idle")
-        self.saturation_rate = data.get("saturation_rate")
-        if data.get("sweep_results"):
-            self.sweep_results = Path(data["sweep_results"])
-        if data.get("steady_state_results"):
-            self.steady_state_results = Path(data["steady_state_results"])
+        self.baseline_rate = data.get("baseline_rate", 128.0)
+        if data.get("benchmark_results"):
+            self.benchmark_results = Path(data["benchmark_results"])
         self.vllm_pid = data.get("vllm_pid")
         self.current_progress = data.get("current_progress", 0)
         

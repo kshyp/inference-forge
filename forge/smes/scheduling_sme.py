@@ -4,6 +4,7 @@ import json
 from typing import Dict, Any, Optional
 
 from .base import BaseSME, DataRequirement, ExperimentSuggestion, SMEResponse, RegistrationInfo
+from .utils import format_nsys_for_prompt
 from forge.llm import (
     IntelligencePool,
     Prompt,
@@ -291,6 +292,10 @@ Guidelines:
         # Extract NCU metrics
         ncu_report = profiling_data.get("ncu_report", {})
         
+        # Extract NSYS analysis (enhanced with LLM insights)
+        nsys_data = profiling_data.get("nsys_report", {})
+        nsys_section = format_nsys_for_prompt(nsys_data, include_timeline=True)
+        
         # Build user prompt
         user_content = f"""Analyze this vLLM profiling data and recommend scheduling optimizations.
 
@@ -309,6 +314,8 @@ Guidelines:
 {json.dumps(ncu_report, indent=2)}
 ```
 
+{nsys_section}
+
 ## Benchmark Results
 ```json
 {json.dumps(benchmark_metrics, indent=2)}
@@ -320,12 +327,19 @@ Guidelines:
 2. Recommend specific config_changes to improve performance
 3. Estimate expected improvement (quantitative where possible)
 
+Use the NSYS timeline analysis to identify:
+- Idle gaps between kernels (scheduling overhead)
+- Prefill vs decode phase efficiency
+- GPU utilization patterns
+
 Respond with JSON only (no markdown, no explanations outside JSON)."""
 
         return Prompt(
             system=self.SYSTEM_PROMPT,
             user=user_content
         )
+    
+
     
     def _extract_primary_finding(self, consensus_result) -> str:
         """Extract primary bottleneck from consensus divergence report."""

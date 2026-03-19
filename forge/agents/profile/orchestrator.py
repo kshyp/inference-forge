@@ -13,6 +13,7 @@ from .profilers.base import BaseProfiler, UnsupportedDataTypeError
 from .profilers.benchmark_metrics import BenchmarkMetricsCollector
 from .profilers.vllm_logs import VLLMLogCollector
 from .profilers.mock_ncu import MockNCUProfiler
+from .profilers.nsys import NSysProfiler
 
 
 @dataclass
@@ -92,9 +93,9 @@ class ProfilerOrchestrator:
         Platform.NVIDIA_CUDA.value: {
             "vllm_logs": VLLMLogCollector,
             "ncu_report": MockNCUProfiler,  # Use mock for testing
+            "nsys_report": NSysProfiler,    # NSys for timeline analysis
             "benchmark_metrics": BenchmarkMetricsCollector,
             # "ncu_report": NCUProfiler,     # Real NCU (deferred)
-            # "nsys_report": NSysProfiler,   # NSys (deferred)
         },
         Platform.AMD_ROCM.value: {
             "vllm_logs": VLLMLogCollector,

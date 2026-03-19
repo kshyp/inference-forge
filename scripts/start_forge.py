@@ -30,6 +30,8 @@ async def main():
     parser.add_argument("--max-iterations", type=int, default=10, help="Maximum iterations")
     parser.add_argument("--no-improvement-limit", type=int, default=3,
                         help="Stop after N iterations without improvement")
+    parser.add_argument("--force-iterations", action="store_true",
+                        help="Run all max-iterations regardless of early convergence")
     parser.add_argument("--test", action="store_true", help="Run a single test iteration")
     args = parser.parse_args()
     
@@ -63,6 +65,7 @@ async def main():
     data_dir = args.data_dir
     max_iterations = args.max_iterations
     no_improvement_limit = args.no_improvement_limit
+    force_iterations = args.force_iterations
     
     if config:
         model = config.get("model", {}).get("name", model)
@@ -70,6 +73,7 @@ async def main():
         data_dir = config.get("data_dir", data_dir)
         max_iterations = config.get("optimization", {}).get("max_iterations", max_iterations)
         no_improvement_limit = config.get("optimization", {}).get("no_improvement_limit", no_improvement_limit)
+        force_iterations = config.get("optimization", {}).get("force_iterations", force_iterations)
     
     if args.test:
         # Run a single test iteration (legacy mode)
@@ -115,6 +119,7 @@ async def main():
             data_dir=data_dir,
             max_iterations=max_iterations,
             no_improvement_limit=no_improvement_limit,
+            force_iterations=force_iterations,
         )
         
         convergence = await engine.run()

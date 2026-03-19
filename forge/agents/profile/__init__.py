@@ -1,23 +1,10 @@
 """Profile Executor Agent (Agent 2).
 
-Collects profiling data required by registered SMEs.
+Collects vLLM debug logs and nsys profiles.
 """
 
-from .agent import ProfilerAgent, ProfileTask
-from .orchestrator import (
-    ExecutionPlan,
-    ExecutionStep,
-    ProfilerCheckpoint,
-    ProfilerOrchestrator,
-)
-from .verifier import ReportVerifier
+from .agent import ProfilerAgent
 
 __all__ = [
     "ProfilerAgent",
-    "ProfileTask",
-    "ProfilerOrchestrator",
-    "ExecutionPlan",
-    "ExecutionStep",
-    "ProfilerCheckpoint",
-    "ReportVerifier",
 ]

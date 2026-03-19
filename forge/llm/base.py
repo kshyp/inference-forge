@@ -94,10 +94,12 @@ class AnthropicClient(LLMClient):
     MODEL_QUALITY = {
         "claude-opus-4-1-20250805": 1.0,
         "claude-opus-4-20250514": 0.98,
+        "claude-opus-4-5-20251101": 0.97,
+        "claude-opus-4-6": 0.96,
         "claude-sonnet-4-20250514": 0.95,
-        "claude-3-7-sonnet-20250219": 0.92,
-        "claude-3-5-sonnet-20241022": 0.88,
-
+        "claude-sonnet-4-5-20250929": 0.94,
+        "claude-sonnet-4-6": 0.93,
+        "claude-haiku-4-5-20251001": 0.85,
     }
     
     async def complete(self, prompt: Prompt, deterministic: bool = False) -> LLMResponse:

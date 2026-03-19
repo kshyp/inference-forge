@@ -36,6 +36,7 @@ env/
 # Data and logs (generated during runs)
 data/experiments/
 data/profiles/
+data/test_*/
 data/*.db
 data/*.json
 scripts/data/

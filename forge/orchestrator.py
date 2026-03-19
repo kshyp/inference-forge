@@ -9,6 +9,7 @@ optimization state across iterations.
 
 import asyncio
 import json
+import os
 import signal
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -18,6 +19,7 @@ from uuid import uuid4
 
 from forge.agents.benchmark.agent import BenchmarkAgent
 from forge.agents.coordinator.agent import CoordinatorAgent
+from forge.agents.coordinator.synthesis import SynthesisConfig
 from forge.agents.profile.agent import ProfilerAgent
 from forge.core.events import ExperimentPlan, RankedExperiment, Task
 from forge.core.state import StateStore
@@ -30,7 +32,7 @@ class IterationResult:
     experiment_id: str
     timestamp: str
     config: Dict[str, Any]
-    saturation_rate: float
+    baseline_rate: float
     metrics: Dict[str, Any]
     experiment_plan: Optional[ExperimentPlan] = None
     
@@ -40,7 +42,7 @@ class IterationResult:
             "experiment_id": self.experiment_id,
             "timestamp": self.timestamp,
             "config": self.config,
-            "saturation_rate": self.saturation_rate,
+            "baseline_rate": self.baseline_rate,
             "metrics": self.metrics,
         }
 
@@ -63,9 +65,17 @@ class ConvergenceState:
         current_config: Dict[str, Any],
         max_iterations: int = 10,
         no_improvement_limit: int = 3,
-        improvement_threshold: float = 0.02
+        improvement_threshold: float = 0.02,
+        backlog_size: int = 0
     ) -> tuple[bool, str]:
         """Check if optimization has converged.
+        
+        Args:
+            current_config: The configuration to check
+            max_iterations: Maximum number of iterations allowed
+            no_improvement_limit: Stop after N iterations without improvement
+            improvement_threshold: Minimum improvement to count as progress
+            backlog_size: Number of experiments still in backlog (if > 0, don't converge)
         
         Returns:
             (converged, reason)
@@ -77,14 +87,24 @@ class ConvergenceState:
             return False, ""
         
         # Check for config convergence (same config already in history)
+        # NOTE: Skip this check if there are still experiments in the backlog.
+        # We want to exhaust all ranked experiments before declaring convergence.
         current_config_str = json.dumps(current_config, sort_keys=True)
         for prev in self.history:
             if json.dumps(prev.config, sort_keys=True) == current_config_str:
+                if backlog_size > 0:
+                    # Config is in history, but we still have backlog experiments to try.
+                    # Don't converge yet - continue with the backlog.
+                    return False, ""
                 self.converged = True
                 self.reason = "Configuration converged (same config repeated)"
                 return True, self.reason
         
         # Check for throughput improvement stagnation
+        # NOTE: Also skip this check if we have backlog experiments remaining
+        if backlog_size > 0:
+            return False, ""
+        
         if len(self.history) >= no_improvement_limit + 1:
             recent = self.history[-(no_improvement_limit + 1):]
             best_throughput = max(r.metrics.get("throughput", 0) for r in recent[:-1])
@@ -144,6 +164,7 @@ class InferenceEngine:
         data_dir: str = "./data",
         max_iterations: int = 10,
         no_improvement_limit: int = 3,
+        force_iterations: bool = False,
     ):
         self.model_name = model_name
         self.port = port
@@ -153,6 +174,14 @@ class InferenceEngine:
         # Convergence settings
         self.max_iterations = max_iterations
         self.no_improvement_limit = no_improvement_limit
+        self.force_iterations = force_iterations  # Run all iterations regardless of convergence
+        
+        # Experiment backlog - work through ranked experiments before re-consulting SMEs
+        self.experiment_backlog: List[RankedExperiment] = []
+        self.current_plan_iteration: int = 0  # Which SME consultation this is
+        
+        # Track configs we've already tried to avoid duplicates
+        self.tried_configs: set[str] = set()
         
         # State
         self.convergence = ConvergenceState()
@@ -161,8 +190,8 @@ class InferenceEngine:
         self.running: bool = False
         self.shutdown_requested: bool = False
         
-        # Baseline saturation rate from first iteration (used for subsequent comparisons)
-        self.baseline_saturation_rate: Optional[float] = None
+        # Baseline rate for all benchmarks (128 RPS)
+        self.baseline_rate: float = 128.0
         
         # Initialize state store
         self.state_store = StateStore(str(self.data_dir / "state.db"))
@@ -183,10 +212,19 @@ class InferenceEngine:
             data_dir=str(data_dir)
         )
         
+        # Create synthesis config to include ALL experiments (no limit)
+        synthesis_config = SynthesisConfig(
+            max_experiments=None,  # Include ALL experiments from SME suggestions
+            ranking_mode="consensus_first",  # Rank by consensus first, then confidence
+            merge_similar=True,
+            merge_threshold=0.8,
+        )
+        
         self.coordinator_agent = CoordinatorAgent(
             state_store=self.state_store,
             health_port=base_health_port + 2,
-            data_dir=str(data_dir)
+            data_dir=str(data_dir),
+            synthesis_config=synthesis_config
         )
         
         # Store health URLs for external monitoring
@@ -199,6 +237,9 @@ class InferenceEngine:
         # Setup signal handlers
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
+        
+        # Try to restore state from previous run
+        self._restore_state()
     
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals gracefully."""
@@ -233,6 +274,9 @@ class InferenceEngine:
         print(f"   Data Dir: {self.data_dir}")
         print(f"   Max Iterations: {self.max_iterations}")
         print(f"   No Improvement Limit: {self.no_improvement_limit}")
+        if self.force_iterations:
+            print(f"   ⚡ Force Iterations: ENABLED (will run all {self.max_iterations} iterations)")
+        print(f"   📋 Backlog Mode: Will try all ranked experiments before re-consulting SMEs")
         print(f"\n🚀 Starting optimization loop...")
         print(f"   Initial config: {json.dumps(self.current_config, indent=2)}")
         print(f"\n📡 Health Endpoints:")
@@ -254,11 +298,13 @@ class InferenceEngine:
                 self.iteration += 1
                 
                 # Check convergence BEFORE running new iteration
-                # This catches repeated configs before wasting time
+                # BUT: Don't converge if there are still experiments in the backlog
+                # (we want to exhaust all suggestions before declaring convergence)
                 converged, reason = self.convergence.check_convergence(
                     self.current_config,
                     self.max_iterations,
-                    self.no_improvement_limit
+                    self.no_improvement_limit,
+                    backlog_size=len(self.experiment_backlog)
                 )
                 
                 if converged:
@@ -278,43 +324,65 @@ class InferenceEngine:
                     self.convergence.reason = f"Max iterations ({self.max_iterations}) reached"
                     break
                 
-                # Run one iteration
-                result = await self._run_iteration()
+                # Get next experiment from backlog or consult SMEs
+                next_experiment = self._get_next_experiment()
+                
+                if next_experiment is None:
+                    # No more experiments to try - need to consult SMEs
+                    print(f"\n📋 Backlog empty - consulting SMEs for new suggestions...")
+                    result = await self._run_iteration()
+                    
+                    if result and result.experiment_plan:
+                        # Populate backlog with ALL ranked experiments from the plan
+                        added_count = self._populate_backlog(result.experiment_plan)
+                        # Save result to history (but don't add to convergence yet)
+                        self._save_state()
+                        
+                        if added_count == 0:
+                            print(f"\n⚠️  No new unique experiments in plan")
+                        
+                        # Try to get next experiment from newly populated backlog
+                        next_experiment = self._get_next_experiment()
+                    
+                    if next_experiment is None:
+                        # Still no experiments after consulting SMEs
+                        if self.force_iterations:
+                            print(f"\n⚡ No new unique experiments, but continuing...")
+                            continue
+                        else:
+                            print(f"\n⚠️  No new unique experiments available - stopping")
+                            self.convergence.converged = True
+                            self.convergence.reason = "Exhausted all unique experiment suggestions"
+                            break
+                
+                # Apply the next experiment
+                new_config = self._apply_experiment(self.current_config, next_experiment)
+                config_key = json.dumps(new_config, sort_keys=True)
+                
+                # Check if we've already tried this config
+                if config_key in self.tried_configs:
+                    print(f"\n🔄 Skipping already-tried config, fetching next...")
+                    continue
+                
+                self.current_config = new_config
+                self.tried_configs.add(config_key)
+                
+                print(f"\n🔄 Trying experiment #{next_experiment.priority} from backlog")
+                print(f"   Config: {json.dumps(self.current_config, indent=2)}")
+                print(f"   Confidence: {next_experiment.confidence:.2f}")
+                print(f"   Sources: {', '.join(next_experiment.source_experts)}")
+                print(f"   Backlog remaining: {len(self.experiment_backlog)}")
+                
+                # Run benchmark with this config
+                result = await self._run_benchmark_only(self.current_config)
                 
                 if result:
                     self.convergence.add_result(result)
-                    
-                    # Print comparison table after each iteration
                     self._print_comparison_table()
-                    
-                    # Save state after each iteration
                     self._save_state()
-                    
-                    # Update config for next iteration
-                    if result.experiment_plan and result.experiment_plan.experiments:
-                        top_exp = result.experiment_plan.experiments[0]
-                        new_config = self._apply_experiment(
-                            self.current_config, 
-                            top_exp
-                        )
-                        
-                        # Check if config actually changed
-                        if json.dumps(new_config, sort_keys=True) == json.dumps(self.current_config, sort_keys=True):
-                            print(f"\n🔄 Config unchanged - convergence detected!")
-                            self.convergence.converged = True
-                            self.convergence.reason = "No new recommendations from SMEs"
-                            break
-                        
-                        self.current_config = new_config
-                        print(f"\n🔄 Next config: {json.dumps(self.current_config, indent=2)}")
-                    else:
-                        print(f"\n⚠️  No experiments recommended - stopping")
-                        self.convergence.converged = True
-                        self.convergence.reason = "No experiments recommended by SMEs"
-                        break
                 else:
-                    print("\n❌ Iteration failed, stopping")
-                    break
+                    print("\n❌ Benchmark failed, trying next experiment...")
+                    continue
                 
                 # Brief pause between iterations
                 if not self.shutdown_requested:
@@ -345,106 +413,38 @@ class InferenceEngine:
         
         try:
             # Phase 1: BENCHMARK
-            if self.baseline_saturation_rate is None:
-                # First iteration: Run throughput benchmark at fixed rate (512 RPS)
-                print(f"\n📊 PHASE 1a: Running throughput benchmark at 512 RPS...")
-                
-                sweep_task = Task(
-                    type="benchmark",
-                    payload={
-                        "experiment_id": experiment_id,
-                        "model_name": self.model_name,
-                        # No target_rate = sweep mode
-                        "vllm_config": {
-                            "port": self.port,
-                            "startup_timeout_seconds": 300,
-                            **self.current_config
-                        },
-                        "guidellm_config": {
-                            "dataset": "wikitext",
-                            "prompt_tokens": 128,
-                            "output_tokens": 64,
-                            "max_requests": 500,
-                        }
+            if self.baseline_rate is None:
+                # Use default baseline rate
+                self.baseline_rate = 128.0
+            
+            print(f"\n📊 PHASE 1: Benchmark at {self.baseline_rate:.0f} RPS...")
+            
+            benchmark_task = Task(
+                type="benchmark",
+                payload={
+                    "experiment_id": experiment_id,
+                    "model_name": self.model_name,
+                    "vllm_config": {
+                        "port": self.port,
+                        "startup_timeout_seconds": 300,
+                        **self.current_config
+                    },
+                    "guidellm_config": {
+                        "dataset": "wikitext",
+                        "prompt_tokens": 128,
+                        "output_tokens": 64,
+                        "max_requests": 500,
                     }
-                )
-                
-                sweep_result = await self.benchmark_agent.run_single_task(sweep_task)
-                
-                if not sweep_result.get("_success"):
-                    print(f"❌ Sweep failed: {sweep_result.get('_error')}")
-                    return None
-                
-                # Extract saturation rate from sweep
-                sweep_data = sweep_result.get("sweep_result", {})
-                saturation_point = sweep_data.get("saturation_point", {})
-                saturation_rate = saturation_point.get("rps", 50.0)
-                self.baseline_saturation_rate = saturation_rate
-                
-                print(f"   ✓ Saturation found: {saturation_rate:.1f} RPS")
-                print(f"\n📊 PHASE 1b: Running at saturation to establish baseline...")
-                
-                # Now run single benchmark at saturation for full metrics
-                baseline_task = Task(
-                    type="benchmark",
-                    payload={
-                        "experiment_id": experiment_id,
-                        "model_name": self.model_name,
-                        "target_rate": saturation_rate,  # Run at saturation
-                        "vllm_config": {
-                            "port": self.port,
-                            "startup_timeout_seconds": 300,
-                            **self.current_config
-                        },
-                        "guidellm_config": {
-                            "dataset": "wikitext",
-                            "prompt_tokens": 128,
-                            "output_tokens": 64,
-                            "max_requests": 500,
-                        }
-                    }
-                )
-                
-                baseline_result = await self.benchmark_agent.run_single_task(baseline_task)
-                
-                if not baseline_result.get("_success"):
-                    print(f"❌ Baseline benchmark failed: {baseline_result.get('_error')}")
-                    return None
-                
-                print(f"   ✓ Baseline benchmark at {saturation_rate:.1f} RPS complete")
-                benchmark_result = baseline_result
-                
-            else:
-                # Subsequent iterations: Run at baseline rate for comparison
-                print(f"\n📊 PHASE 1: Benchmark (comparing at baseline {self.baseline_saturation_rate:.1f} RPS)...")
-                
-                benchmark_task = Task(
-                    type="benchmark",
-                    payload={
-                        "experiment_id": experiment_id,
-                        "model_name": self.model_name,
-                        "target_rate": self.baseline_saturation_rate,
-                        "vllm_config": {
-                            "port": self.port,
-                            "startup_timeout_seconds": 300,
-                            **self.current_config
-                        },
-                        "guidellm_config": {
-                            "dataset": "wikitext",
-                            "prompt_tokens": 128,
-                            "output_tokens": 64,
-                            "max_requests": 500,
-                        }
-                    }
-                )
-                
-                benchmark_result = await self.benchmark_agent.run_single_task(benchmark_task)
-                
-                if not benchmark_result.get("_success"):
-                    print(f"❌ Benchmark failed: {benchmark_result.get('_error')}")
-                    return None
-                
-                saturation_rate = self.baseline_saturation_rate
+                }
+            )
+            
+            benchmark_result = await self.benchmark_agent.run_single_task(benchmark_task)
+            
+            if not benchmark_result.get("_success"):
+                print(f"❌ Benchmark failed: {benchmark_result.get('_error')}")
+                return None
+            
+            baseline_rate = self.baseline_rate
             
             # Extract full metrics from benchmark result
             benchmark_res = benchmark_result.get("benchmark_result", {})
@@ -484,7 +484,7 @@ class InferenceEngine:
                 for config_line in config_lines[1:]:
                     print(f"   ║          {config_line:<59}║")
                 print(f"   ╠══════════════════════════════════════════════════════════════════════════╣")
-                print(f"   ║  Saturation Rate: {self.baseline_saturation_rate:>6.1f} RPS                                              ║")
+                print(f"   ║  Baseline Rate: {self.baseline_rate:>6.0f} RPS                                                ║")
                 print(f"   ║  Throughput:      {baseline_metrics['throughput']:>6.1f} req/s                                          ║")
                 print(f"   ║  Total Tok/s:     {baseline_metrics['total_tokens_per_sec']:>8.1f}                                        ║")
                 print(f"   ║  Output Tok/s:    {baseline_metrics['output_tokens_per_sec']:>8.1f}                                        ║")
@@ -494,7 +494,7 @@ class InferenceEngine:
                 print(f"   → All subsequent iterations will be compared against these metrics\n")
             else:
                 # Subsequent iterations: Show comparison
-                print(f"   ✓ Running at baseline rate: {self.baseline_saturation_rate:.1f} RPS")
+                print(f"   ✓ Running at baseline rate: {self.baseline_rate:.0f} RPS")
                 print(f"   📊 Current: {baseline_metrics['throughput']:.1f} req/s, "
                       f"TTFT={baseline_metrics['ttft_p50']:.0f}/{baseline_metrics['ttft_p95']:.0f}/{baseline_metrics['ttft_p99']:.0f}ms, "
                       f"TPOT={baseline_metrics['tpot_p50']:.0f}/{baseline_metrics['tpot_p95']:.0f}/{baseline_metrics['tpot_p99']:.0f}ms")
@@ -518,70 +518,71 @@ class InferenceEngine:
             collected_data = {}
             benchmark_metrics = baseline_metrics  # Use sweep metrics as default
             
-            # Ensure experiment_id is a valid UUID string for the profiler
-            profile_exp_id = str(uuid4())
+            # Phase 2: PROFILE - Collect debug logs and nsys profile
+            print(f"\n🔍 PHASE 2: Profile (debug logs + nsys)...")
             
             profile_task = Task(
                 type="profile",
                 payload={
-                    "experiment_id": profile_exp_id,
-                    "benchmark_result": {
-                        "experiment_id": profile_exp_id,
-                        "config_flags": self.current_config,
-                        "saturation_point": {
-                            "rps": saturation_rate,
-                            "latency_ms": 0,
-                            "error_rate": 0.0,
-                            "confidence": "high",
-                        },
-                        "hardware_info": {
-                            "gpu_count": 1,
-                            "gpu_type": "T4",
-                            "gpu_memory_gb": 16,
-                            "driver_version": "535",
-                            "cuda_version": "12.2",
-                            "platform": "nvidia_cuda",
-                        },
-                        "guidellm_report_path": str(self.data_dir / "experiments" / experiment_id / "sweep_results.json"),
-                        "vllm_logs_path": str(self.data_dir / "experiments" / experiment_id / "vllm_server.log"),
-                        "vllm_command": f"python -m vllm.entrypoints.openai.api_server --model {self.model_name} --port {self.port}",
-                    },
-                    "data_requirements": data_requirements,
-                    "platform_info": "nvidia_cuda",
-                    "output_dir": str(self.data_dir / "profiles"),
+                    "experiment_id": experiment_id,
+                    "model_name": self.model_name,
+                    "vllm_config": {"port": self.port, **self.current_config},
                     "guidellm_config": {
                         "dataset": "wikitext",
                         "prompt_tokens": 128,
                         "output_tokens": 64,
                         "max_requests": 200,
                     },
-                    "vllm_config": {"port": self.port, **self.current_config},
+                    "enable_nsys": True,
                 }
             )
             
             try:
                 profile_result = await self.profiler_agent.run_single_task(profile_task)
                 
-                if profile_result.get("_success") and profile_result.get("benchmark_metrics"):
-                    print(f"   ✓ Profile succeeded")
-                    collected_data = profile_result.get("collected_data", {})
-                    profiler_metrics = profile_result.get("benchmark_metrics", {})
-                    # Merge: use baseline_metrics as primary, fill in from profiler if missing
-                    metrics = {**baseline_metrics}
-                    for key in ['throughput', 'total_tokens_per_sec', 'output_tokens_per_sec', 
-                                'ttft_p50', 'ttft_p95', 'ttft_p99', 'tpot_p50', 'tpot_p95', 'tpot_p99']:
-                        if key in profiler_metrics and profiler_metrics[key]:
-                            metrics[key] = profiler_metrics[key]
+                if profile_result.get("_success"):
+                    print(f"   ✓ Profile complete")
+                    print(f"   Log: {profile_result.get('log_file', 'N/A')}")
+                    
+                    # Build collected_data for SME analysis
+                    collected_data = {
+                        "vllm_logs": {"log_file": profile_result.get("log_file")},
+                    }
+                    
+                    # Analyze NSYS report if available
+                    nsys_report_path = profile_result.get('nsys_report')
+                    if nsys_report_path:
+                        print(f"   NSys report: {nsys_report_path}")
+                        try:
+                            from forge.llm.nsys_analyzer import NSYSAnalyzer
+                            nsys_analyzer = NSYSAnalyzer()
+                            print(f"   Analyzing NSYS report...")
+                            nsys_analysis = await nsys_analyzer.analyze(
+                                nsys_report_path, 
+                                enable_llm_analysis=True
+                            )
+                            collected_data["nsys_report"] = nsys_analysis.to_dict()
+                            print(f"   ✓ NSYS analysis complete")
+                            print(f"     GPU util: {nsys_analysis.metrics.gpu_utilization_percent:.1f}%" 
+                                  if nsys_analysis.metrics.gpu_utilization_percent else "     GPU util: N/A")
+                            if nsys_analysis.bottlenecks:
+                                print(f"     Bottlenecks: {len(nsys_analysis.bottlenecks)}")
+                        except Exception as e:
+                            print(f"   ⚠️  NSYS analysis failed: {e}")
+                            # Fallback to just the path
+                            collected_data["nsys_report"] = {"report_path": nsys_report_path}
+                    
+                    metrics = baseline_metrics  # Use benchmark metrics
                 else:
                     print(f"   ⚠️  Profile failed: {profile_result.get('_error')}")
-                    print(f"   Using baseline benchmark metrics")
-                    metrics = baseline_metrics
                     collected_data = {}
+                    metrics = baseline_metrics
             except Exception as e:
                 print(f"   ⚠️  Profile exception: {e}")
-                print(f"   Using baseline benchmark metrics")
-                metrics = baseline_metrics
+                import traceback
+                traceback.print_exc()
                 collected_data = {}
+                metrics = baseline_metrics
             
             print(f"\n📈 Final Metrics:")
             print(f"   Throughput: {metrics['throughput']:.1f} req/s")
@@ -621,7 +622,7 @@ class InferenceEngine:
                 experiment_id=experiment_id,
                 timestamp=timestamp,
                 config=self.current_config.copy(),
-                saturation_rate=saturation_rate,
+                baseline_rate=baseline_rate,
                 metrics=metrics,
                 experiment_plan=experiment_plan
             )
@@ -757,7 +758,7 @@ class InferenceEngine:
         
         print("="*130)
         print("Legend: 🟢 = Improvement >5%, 🔴 = Regression >5%, ⚪ = Within 5%, 📊 = Baseline")
-        print(f"Baseline: {baseline_throughput:.1f} req/s at {self.baseline_saturation_rate:.1f} RPS saturation rate")
+        print(f"Baseline: {baseline_throughput:.1f} req/s at {self.baseline_rate:.0f} RPS")
         print("="*130 + "\n")
     
     def _wrap_config(self, config_pairs: List[str], max_line_len: int = 35) -> List[str]:
@@ -861,6 +862,222 @@ class InferenceEngine:
         # Return zeros if extraction fails
         return {"throughput": 0, "ttft_p99": 0, "tpot_p99": 0, "latency_p99": 0, "error_rate": 0}
     
+    def _get_next_experiment(self) -> Optional[RankedExperiment]:
+        """Get the next experiment from the backlog, skipping already-tried configs."""
+        while self.experiment_backlog:
+            exp = self.experiment_backlog.pop(0)
+            test_config = self._apply_experiment(self.current_config, exp)
+            config_key = json.dumps(test_config, sort_keys=True)
+            
+            if config_key not in self.tried_configs:
+                return exp
+            else:
+                print(f"   (Skipping already-tried experiment #{exp.priority})")
+        
+        return None
+    
+    def _populate_backlog(self, plan: ExperimentPlan) -> int:
+        """Populate the experiment backlog from a new plan.
+        
+        Only adds experiments with unique configs that haven't been tried
+        and aren't already in the backlog.
+        Returns the number of new experiments added.
+        """
+        # Build set of configs already in backlog
+        backlog_configs = set()
+        for backlog_exp in self.experiment_backlog:
+            test_config = self._apply_experiment(self.current_config, backlog_exp)
+            config_key = json.dumps(test_config, sort_keys=True)
+            backlog_configs.add(config_key)
+        
+        new_experiments = []
+        skipped_tried = 0
+        skipped_duplicate = 0
+        
+        for exp in plan.experiments:
+            # Check if this experiment's config is unique
+            test_config = self._apply_experiment(self.current_config, exp)
+            config_key = json.dumps(test_config, sort_keys=True)
+            
+            if config_key in self.tried_configs:
+                skipped_tried += 1
+                continue  # Skip already-tried configs
+            
+            if config_key in backlog_configs:
+                skipped_duplicate += 1
+                continue  # Skip duplicates already in backlog
+            
+            new_experiments.append(exp)
+            backlog_configs.add(config_key)  # Track to avoid duplicates within this batch
+        
+        # Add new experiments to the backlog
+        self.experiment_backlog.extend(new_experiments)
+        self.current_plan_iteration = plan.iteration
+        
+        if new_experiments:
+            print(f"\n📋 Added {len(new_experiments)} new experiments to backlog")
+            if skipped_tried > 0:
+                print(f"   (Skipped {skipped_tried} already-tried)")
+            if skipped_duplicate > 0:
+                print(f"   (Skipped {skipped_duplicate} duplicates)")
+            print(f"   Backlog size: {len(self.experiment_backlog)} experiments")
+            print(f"   SME consultation #{self.current_plan_iteration}")
+        
+        return len(new_experiments)
+    
+    async def _run_benchmark_only(
+        self, 
+        config: Dict[str, Any]
+    ) -> Optional[IterationResult]:
+        """Run only the benchmark phase with a given config (no profiling/SME consultation)."""
+        experiment_id = str(uuid4())
+        timestamp = datetime.now().isoformat()
+        
+        print(f"\n{'='*80}")
+        print(f"🔁 ITERATION {self.iteration} (Backlog execution)")
+        print(f"{'='*80}")
+        print(f"🆔 Experiment: {experiment_id}")
+        print(f"⚙️  Config: {json.dumps(config, indent=2)}")
+        
+        try:
+            # Determine target rate
+            if self.baseline_rate is None:
+                # First time - need to find saturation
+                print(f"\n📊 Finding saturation rate...")
+                
+                sweep_task = Task(
+                    type="benchmark",
+                    payload={
+                        "experiment_id": experiment_id,
+                        "model_name": self.model_name,
+                        "vllm_config": {
+                            "port": self.port,
+                            "startup_timeout_seconds": 300,
+                            **config
+                        },
+                        "guidellm_config": {
+                            "dataset": "wikitext",
+                            "prompt_tokens": 128,
+                            "output_tokens": 64,
+                            "max_requests": 500,
+                        }
+                    }
+                )
+                
+                sweep_result = await self.benchmark_agent.run_single_task(sweep_task)
+                
+                if not sweep_result.get("_success"):
+                    print(f"❌ Sweep failed: {sweep_result.get('_error')}")
+                    return None
+                
+                sweep_data = sweep_result.get("sweep_result", {})
+                saturation_point = sweep_data.get("saturation_point", {})
+                baseline_rate = sweep_result.get("baseline_rate", 128.0)
+                self.baseline_rate = baseline_rate
+                print(f"   ✓ Baseline established: {baseline_rate:.0f} RPS")
+                
+                # Run at saturation for full metrics
+                print(f"\n📊 Running benchmark at saturation...")
+                benchmark_task = Task(
+                    type="benchmark",
+                    payload={
+                        "experiment_id": experiment_id,
+                        "model_name": self.model_name,
+                        # No target_rate needed - benchmark agent uses fixed rate
+                        "vllm_config": {
+                            "port": self.port,
+                            "startup_timeout_seconds": 300,
+                            **config
+                        },
+                        "guidellm_config": {
+                            "dataset": "wikitext",
+                            "prompt_tokens": 128,
+                            "output_tokens": 64,
+                            "max_requests": 500,
+                        }
+                    }
+                )
+                benchmark_result = await self.benchmark_agent.run_single_task(benchmark_task)
+                
+                if not benchmark_result.get("_success"):
+                    print(f"❌ Benchmark failed: {benchmark_result.get('_error')}")
+                    return None
+                    
+            else:
+                # Use baseline rate
+                baseline_rate = self.baseline_rate
+                print(f"\n📊 Benchmark at baseline {baseline_rate:.0f} RPS...")
+                
+                benchmark_task = Task(
+                    type="benchmark",
+                    payload={
+                        "experiment_id": experiment_id,
+                        "model_name": self.model_name,
+                        # No target_rate needed - benchmark agent uses fixed rate
+                        "vllm_config": {
+                            "port": self.port,
+                            "startup_timeout_seconds": 300,
+                            **config
+                        },
+                        "guidellm_config": {
+                            "dataset": "wikitext",
+                            "prompt_tokens": 128,
+                            "output_tokens": 64,
+                            "max_requests": 500,
+                        }
+                    }
+                )
+                benchmark_result = await self.benchmark_agent.run_single_task(benchmark_task)
+                
+                if not benchmark_result.get("_success"):
+                    print(f"❌ Benchmark failed: {benchmark_result.get('_error')}")
+                    return None
+            
+            # Extract metrics
+            benchmark_res = benchmark_result.get("benchmark_result", {})
+            metrics_data = benchmark_res.get("metrics", {})
+            
+            def get_percentile(data, metric, percentile):
+                val = data.get(metric, {}).get(percentile, 0)
+                return val * 1000 if val and val < 10 else val
+            
+            metrics = {
+                "throughput": metrics_data.get("requests_per_sec", 0),
+                "total_tokens_per_sec": metrics_data.get("total_tokens_per_sec", 0),
+                "output_tokens_per_sec": metrics_data.get("output_tokens_per_sec", 0),
+                "ttft_p50": get_percentile(metrics_data, "ttft_ms", "p50"),
+                "ttft_p95": get_percentile(metrics_data, "ttft_ms", "p95"),
+                "ttft_p99": get_percentile(metrics_data, "ttft_ms", "p99"),
+                "tpot_p50": get_percentile(metrics_data, "tpot_ms", "p50"),
+                "tpot_p95": get_percentile(metrics_data, "tpot_ms", "p95"),
+                "tpot_p99": get_percentile(metrics_data, "tpot_ms", "p99"),
+                "latency_p50": get_percentile(metrics_data, "itl_ms", "p50"),
+                "latency_p95": get_percentile(metrics_data, "itl_ms", "p95"),
+                "latency_p99": get_percentile(metrics_data, "itl_ms", "p99"),
+                "error_rate": 0,
+            }
+            
+            print(f"\n📊 Results:")
+            print(f"   Throughput: {metrics['throughput']:.1f} req/s")
+            print(f"   Total Tok/s: {metrics['total_tokens_per_sec']:.1f}")
+            print(f"   TTFT p50/p95/p99: {metrics['ttft_p50']:.0f}/{metrics['ttft_p95']:.0f}/{metrics['ttft_p99']:.0f} ms")
+            
+            return IterationResult(
+                iteration=self.iteration,
+                experiment_id=experiment_id,
+                timestamp=timestamp,
+                config=config.copy(),
+                baseline_rate=baseline_rate,
+                metrics=metrics,
+                experiment_plan=None  # No plan from backlog execution
+            )
+            
+        except Exception as e:
+            print(f"\n❌ Error in benchmark: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
     def _apply_experiment(
         self, 
         base_config: Dict[str, Any], 
@@ -875,6 +1092,55 @@ class InferenceEngine:
             new_config.pop(key, None)
         
         return new_config
+    
+    def _restore_state(self) -> None:
+        """Restore optimization state from disk if exists."""
+        state_file = self.data_dir / "optimization_state.json"
+        
+        if not state_file.exists():
+            return  # No previous state
+        
+        try:
+            with open(state_file, "r") as f:
+                state = json.load(f)
+            
+            # Restore tried configs
+            if "tried_configs" in state:
+                self.tried_configs = set(state["tried_configs"])
+                print(f"   📝 Restored {len(self.tried_configs)} tried configs")
+            
+            # Restore experiment backlog
+            if "experiment_backlog" in state:
+                from forge.core.events import RankedExperiment
+                self.experiment_backlog = [
+                    RankedExperiment(
+                        priority=exp.get("priority", i + 1),
+                        config_patch=exp.get("config_patch", {}),
+                        config_removals=exp.get("config_removals", []),
+                        hypothesis=exp.get("hypothesis", ""),
+                        expected_improvement=exp.get("expected_improvement", ""),
+                        success_criteria=exp.get("success_criteria", ""),
+                        source_experts=exp.get("source_experts", []),
+                        confidence=exp.get("confidence", 0.0),
+                        abort_conditions=exp.get("abort_conditions", []),
+                    )
+                    for i, exp in enumerate(state["experiment_backlog"])
+                ]
+                print(f"   📋 Restored {len(self.experiment_backlog)} experiments in backlog")
+            
+            # Restore other state
+            if "current_plan_iteration" in state:
+                self.current_plan_iteration = state["current_plan_iteration"]
+            
+            if "baseline_rate" in state:
+                self.baseline_rate = state["baseline_rate"]
+                print(f"   📊 Restored baseline rate: {self.baseline_rate:.0f} RPS")
+            
+            print(f"   ✅ State restored from {state_file}")
+            
+        except Exception as e:
+            print(f"   ⚠️  Could not restore state: {e}")
+            # Continue with fresh state
     
     def _save_state(self) -> None:
         """Save current optimization state to disk."""
@@ -896,7 +1162,25 @@ class InferenceEngine:
             "convergence_reason": self.convergence.reason,
             "best_iteration": self.convergence.best_iteration,
             "best_config": self.convergence.best_config,
-            "history": [r.to_dict() for r in self.convergence.history]
+            "history": [r.to_dict() for r in self.convergence.history],
+            # Persist tried configs and backlog for crash recovery
+            "tried_configs": list(self.tried_configs),
+            "experiment_backlog": [
+                {
+                    "priority": exp.priority,
+                    "config_patch": exp.config_patch,
+                    "config_removals": exp.config_removals,
+                    "hypothesis": exp.hypothesis,
+                    "expected_improvement": exp.expected_improvement,
+                    "success_criteria": exp.success_criteria,
+                    "source_experts": exp.source_experts,
+                    "confidence": exp.confidence,
+                    "abort_conditions": exp.abort_conditions,
+                }
+                for exp in self.experiment_backlog
+            ],
+            "current_plan_iteration": self.current_plan_iteration,
+            "baseline_rate": self.baseline_rate,
         }
         
         with open(state_file, "w") as f:
@@ -982,6 +1266,8 @@ async def main():
     parser.add_argument("--max-iterations", type=int, default=10, help="Max iterations")
     parser.add_argument("--no-improvement-limit", type=int, default=3, 
                         help="Stop after N iterations without improvement")
+    parser.add_argument("--force-iterations", action="store_true",
+                        help="Run all max-iterations regardless of early convergence")
     
     args = parser.parse_args()
     
@@ -1005,6 +1291,7 @@ async def main():
         data_dir=args.data_dir,
         max_iterations=args.max_iterations,
         no_improvement_limit=args.no_improvement_limit,
+        force_iterations=args.force_iterations,
     )
     
     convergence = await engine.run()

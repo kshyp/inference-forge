@@ -15,6 +15,7 @@ from .base import (
 )
 from .benchmark_metrics import BenchmarkMetricsCollector
 from .mock_ncu import MockNCUProfiler
+from .nsys import NSysProfiler
 from .vllm_logs import VLLMLogCollector
 
 __all__ = [
@@ -33,5 +34,6 @@ __all__ = [
     # Profilers
     "VLLMLogCollector",
     "MockNCUProfiler",
+    "NSysProfiler",
     "BenchmarkMetricsCollector",
 ]

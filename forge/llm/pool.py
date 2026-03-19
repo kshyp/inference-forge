@@ -48,7 +48,7 @@ class IntelligencePool:
         "anthropic": {
             "env_key": "ANTHROPIC_API_KEY",
             "client_class": AnthropicClient,
-            "models": ["claude-sonnet-4-20250514"],
+            "models": ["claude-sonnet-4-20250514", "claude-haiku-4-5-20251001"],
             "base_url_env": None,
         },
         "openai": {

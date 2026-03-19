@@ -21,11 +21,18 @@ class SynthesisConfig:
     min_confidence: float = 0.5
     
     # Maximum number of experiments to recommend
-    max_experiments: int = 5
+    # Set to None or 0 to include ALL experiments (exhaustive mode)
+    max_experiments: Optional[int] = None
     
     # Weight for SME confidence vs consensus agreement
+    # Note: Only used when ranking_mode is "combined"
     confidence_weight: float = 0.6
     agreement_weight: float = 0.4
+    
+    # Ranking mode: "consensus_first" (default) or "combined"
+    # - "consensus_first": Sort by consensus score first, then by confidence
+    # - "combined": Use weighted combination of confidence and consensus
+    ranking_mode: str = "consensus_first"
     
     # Whether to merge similar suggestions
     merge_similar: bool = True
@@ -117,25 +124,19 @@ class ExperimentSynthesizer:
             logger.warning("No suggestions to synthesize")
             return self._create_empty_plan(iteration, parent_experiment_id)
         
-        # FALLBACK: If filtering would remove all suggestions, pick best raw suggestion
-        # This ensures we always have something to try, even without consensus
-        if all(sug.confidence < self.config.min_confidence for _, sug in all_suggestions):
-            logger.warning(f"All suggestions below confidence threshold {self.config.min_confidence}")
-            logger.warning("FALLBACK: Picking highest confidence suggestion anyway")
-            best = max(all_suggestions, key=lambda x: x[1].confidence)
-            return self._create_single_experiment_plan(
-                best[0], best[1], current_config, iteration, 
-                parent_experiment_id, sme_ids, sme_responses,
-                fallback_reason="low_confidence"
-            )
+        # Step 2: Include ALL suggestions (don't filter by confidence or agreement)
+        # We want to rank ALL candidates and try them before re-consulting SMEs.
+        # The ranking will prioritize:
+        #   1. High consensus (multiple SMEs agreeing) first
+        #   2. Within same consensus level, higher confidence first
+        #   3. Within same confidence, higher agreement ratio first
+        if all_suggestions:
+            confidences = [sug.confidence for _, sug in all_suggestions]
+            logger.info(f"Suggestion confidences: min={min(confidences):.2f}, max={max(confidences):.2f}, avg={sum(confidences)/len(confidences):.2f}")
         
-        # Step 2: Filter by minimum confidence
-        filtered = [
-            (sme_id, sug) for sme_id, sug in all_suggestions
-            if sug.confidence >= self.config.min_confidence
-        ]
+        filtered = all_suggestions
         
-        logger.info(f"After confidence filter (>{self.config.min_confidence}): {len(filtered)}")
+        logger.info(f"Total candidates for ranking: {len(filtered)}")
         
         # Step 3: Merge similar suggestions
         if self.config.merge_similar:
@@ -153,22 +154,29 @@ class ExperimentSynthesizer:
         
         logger.info(f"After merging: {len(merged)} unique experiments")
         
-        # FALLBACK: If no experiments after filtering/merging, pick best from all
+        # NOTE: We no longer fall back to a single experiment.
+        # If merging produces no results (shouldn't happen), use all raw suggestions.
         if not merged:
-            logger.warning("No experiments after filtering/merging")
-            logger.warning("FALLBACK: Picking highest confidence raw suggestion")
-            best = max(all_suggestions, key=lambda x: x[1].confidence)
-            return self._create_single_experiment_plan(
-                best[0], best[1], current_config, iteration,
-                parent_experiment_id, sme_ids, sme_responses,
-                fallback_reason="no_consensus"
-            )
+            logger.warning("No experiments after merging - using all raw suggestions")
+            merged = [
+                MergedExperiment(
+                    config_changes=sug.config_changes,
+                    sources=[(sme_id, sug.confidence)],
+                    expected_improvements=[sug.expected_improvement],
+                    rationales=[sug.rationale]
+                )
+                for sme_id, sug in all_suggestions
+            ]
         
         # Step 4: Score and rank
         scored = self._score_experiments(merged)
         
-        # Step 5: Select top N
-        top_experiments = scored[:self.config.max_experiments]
+        # Step 5: Select top N (or ALL if max_experiments is None/0)
+        if self.config.max_experiments:
+            top_experiments = scored[:self.config.max_experiments]
+        else:
+            # Include ALL experiments - exhaust the backlog before re-consulting SMEs
+            top_experiments = scored
         
         # Step 6: Detect conflicts
         conflicts = self._detect_conflicts(top_experiments)
@@ -278,18 +286,30 @@ class ExperimentSynthesizer:
         self, 
         experiments: List[MergedExperiment]
     ) -> List[Tuple[float, MergedExperiment]]:
-        """Score and sort experiments by combined metric."""
+        """Score and sort experiments by ranking mode.
+        
+        Supports two ranking modes:
+        - "consensus_first": Sort by consensus score first, then by confidence
+        - "combined": Use weighted combination of confidence and consensus
+        """
         scored = []
         
         for exp in experiments:
-            # Combined score = confidence * consensus
-            score = (
-                self.config.confidence_weight * exp.avg_confidence +
-                self.config.agreement_weight * exp.consensus_score
-            )
+            if self.config.ranking_mode == "consensus_first":
+                # Primary: consensus score (more SMEs agreeing = higher priority)
+                # Secondary: confidence score (for tie-breaking within same consensus level)
+                # Pack into a tuple for tuple comparison: (consensus, confidence)
+                score = (exp.consensus_score, exp.avg_confidence)
+            else:
+                # Combined weighted score for single-dimensional ranking
+                score = (
+                    self.config.confidence_weight * exp.avg_confidence +
+                    self.config.agreement_weight * exp.consensus_score
+                )
             scored.append((score, exp))
         
         # Sort by score descending
+        # For tuple scores (consensus_first), Python compares element by element
         scored.sort(key=lambda x: x[0], reverse=True)
         return scored
     
@@ -432,54 +452,4 @@ class ExperimentSynthesizer:
             synthesis_reasoning="No suggestions from SMEs. Consider baseline exploration."
         )
     
-    def _create_single_experiment_plan(
-        self,
-        sme_id: str,
-        suggestion: Any,  # ExperimentSuggestion
-        current_config: Dict[str, Any],
-        iteration: int,
-        parent_experiment_id: Optional[str],
-        sme_ids: List[str],
-        sme_responses: List[Any],  # List[SMEResponse]
-        fallback_reason: str = "unknown"
-    ) -> ExperimentPlan:
-        """Create a plan with a single experiment (fallback mode)."""
-        # Build config patch
-        config_patch = {}
-        for key, value in suggestion.config_changes.items():
-            if key not in current_config or current_config[key] != value:
-                config_patch[key] = value
-        
-        # Create single ranked experiment
-        experiment = RankedExperiment(
-            priority=1,
-            config_patch=config_patch,
-            config_removals=[],
-            hypothesis=f"[FALLBACK - {fallback_reason}] {suggestion.rationale[:200]}",
-            expected_improvement=suggestion.expected_improvement,
-            success_criteria="throughput improvement > 0% AND no errors",
-            source_experts=[sme_id],
-            confidence=suggestion.confidence,
-            abort_conditions=["oom", "error_rate > 0.1"]
-        )
-        
-        # Build reasoning
-        reasoning = (
-            f"FALLBACK MODE ({fallback_reason}): No consensus reached among {len(sme_ids)} SMEs. "
-            f"Picking highest confidence suggestion from {sme_id} (conf={suggestion.confidence:.2f}). "
-            f"Config changes: {suggestion.config_changes}"
-        )
-        
-        logger.warning(reasoning)
-        
-        return ExperimentPlan(
-            iteration=iteration,
-            parent_experiment_id=parent_experiment_id,
-            experiments=[experiment],
-            signals_detected=list(set(
-                sig for resp in sme_responses
-                for sig in resp.findings.get("triggers", [])
-            )),
-            smes_consulted=sme_ids,
-            synthesis_reasoning=reasoning
-        )
+
