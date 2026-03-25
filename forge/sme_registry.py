@@ -2,7 +2,8 @@
 
 import pkgutil
 import importlib
-from typing import Dict, List, Type, Optional, Set, Any
+from pathlib import Path
+from typing import Dict, List, Type, Optional, Set, Any, Tuple
 from dataclasses import dataclass, field
 
 from forge.smes.base import BaseSME, DataRequirement, RegistrationInfo, SMEResponse
@@ -23,7 +24,11 @@ class SMERegistry:
     1. Discover and load SME classes
     2. Register SMEs based on platform compatibility
     3. Aggregate data requirements for the profiler
-    4. Consult relevant SMEs based on signals
+    4. Consult ALL SMEs - each SME determines its own relevance by scanning data
+    
+    NOTE: The Coordinator NO LONGER decides which SME gets triggered.
+    All profiling data is available to all SMEs in the profile directory.
+    Each SME scans the data to determine if it reveals bottlenecks for their expertise.
     """
     
     def __init__(self):
@@ -122,7 +127,6 @@ class SMERegistry:
                     self.registered_smes.append(RegisteredSME(instance, reg_info))
                     registered[reg_info.sme_id] = reg_info
                     print(f"✅ {sme_class.__name__:25} | ID: {reg_info.sme_id:20} | "
-                          f"Triggers: {len(reg_info.triggers)} | "
                           f"Data sources: {len(reg_info.data_requirements)}")
                 else:
                     print(f"❌ {sme_class.__name__:25} | Not applicable for this platform")
@@ -212,64 +216,80 @@ class SMERegistry:
                     required.add(req.data_type)
         return required
     
-    async def consult(self, signals: List[str], 
+    async def consult(self, 
+                      profile_dir: Path,
                       profiling_data: Dict[str, Any],
-                      benchmark_metrics: Dict[str, Any]) -> List[SMEResponse]:
+                      benchmark_metrics: Dict[str, Any]) -> Tuple[List[SMEResponse], List[str]]:
         """
-        Consult relevant SMEs based on detected signals.
+        Consult ALL registered SMEs.
+        
+        Each SME scans the data to determine its own relevance.
+        The Coordinator NO LONGER filters SMEs based on signals.
         
         This is async to enable parallel LLM calls across all consulted SMEs.
         
         Args:
-            signals: List of detected signals (e.g., ["low_gpu_utilization", "high_ttft"])
+            profile_dir: Path to directory containing profiling data files
             profiling_data: Data collected by the profiler
             benchmark_metrics: Results from benchmark run
             
         Returns:
-            List of SMEResponses from consulted SMEs
+            Tuple of (responses, sme_ids) where:
+                - responses: List of SMEResponses from all SMEs (including non-relevant ones)
+                - sme_ids: List of SME IDs corresponding to each response (parallel list)
         """
         import asyncio
         
-        print(f"\n[SMERegistry] Consulting SMEs for signals: {signals}")
+        print(f"\n[SMERegistry] Consulting ALL {len(self.registered_smes)} SMEs")
+        print(f"   Profile directory: {profile_dir}")
         print("-" * 60)
         
-        # Find all SMEs that should be consulted
+        # Create async tasks for ALL SMEs (no filtering)
         tasks = []
         sme_info = []
         
         for registered in self.registered_smes:
-            sme_triggers = set(registered.info.triggers)
-            matched_signals = sme_triggers.intersection(set(signals))
+            sme_id = registered.info.sme_id
             
-            if matched_signals:
-                print(f"🔍 {registered.info.sme_id}: triggered by {matched_signals}")
+            # First, let SME scan data to determine relevance
+            is_relevant, relevance_score, reason = registered.instance.scan_data(
+                profile_dir, profiling_data, benchmark_metrics
+            )
+            
+            if is_relevant:
+                print(f"🔍 {sme_id}: RELEVANT (score={relevance_score:.2f}) - {reason}")
                 # Create async task for this SME
-                task = registered.instance.analyze(profiling_data, benchmark_metrics)
+                task = registered.instance.analyze(profile_dir, profiling_data, benchmark_metrics)
                 tasks.append(task)
-                sme_info.append(registered.info.sme_id)
+                sme_info.append(sme_id)
             else:
-                print(f"   {registered.info.sme_id}: not triggered")
+                print(f"   {sme_id}: NOT RELEVANT (score={relevance_score:.2f}) - {reason}")
         
         if not tasks:
             print("-" * 60)
-            print(f"[SMERegistry] No SMEs triggered\n")
-            return []
+            print(f"[SMERegistry] No SMEs found relevant to this data\n")
+            return [], []
+        
+        print(f"\n[SMERegistry] Running analysis for {len(tasks)} relevant SME(s)...")
         
         # Run all SME analyses in parallel
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
         responses = []
+        consulted_sme_ids = []
         for sme_id, result in zip(sme_info, results):
             if isinstance(result, Exception):
                 print(f"   ⚠️  {sme_id} analysis failed: {result}")
             else:
                 responses.append(result)
+                consulted_sme_ids.append(sme_id)
+                status = "✓ relevant" if result.is_relevant else "✗ not relevant"
                 print(f"   → {sme_id}: {len(result.suggestions)} suggestion(s), "
-                      f"confidence: {result.confidence:.2f}")
+                      f"confidence: {result.confidence:.2f}, {status}")
         
         print("-" * 60)
-        print(f"[SMERegistry] Consulted {len(responses)}/{len(tasks)} SME(s)\n")
-        return responses
+        print(f"[SMERegistry] Completed {len(responses)}/{len(tasks)} analysis(es)\n")
+        return responses, consulted_sme_ids
     
     def get_registered_sme_ids(self) -> List[str]:
         """Get list of registered SME IDs."""

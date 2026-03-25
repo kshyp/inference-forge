@@ -13,6 +13,7 @@ from .scheduling_sme import SchedulingSME
 from .speculative_sme import SpeculativeSME
 from .model_parallelism_sme import ModelParallelismSME
 from .cpu_optimizations_sme import CPUOptimizationsSME
+from .memory_management_sme import MemoryManagementSME
 
 __all__ = [
     # Base classes
@@ -27,4 +28,5 @@ __all__ = [
     "SpeculativeSME",
     "ModelParallelismSME",
     "CPUOptimizationsSME",
+    "MemoryManagementSME",
 ]

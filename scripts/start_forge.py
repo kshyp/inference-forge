@@ -32,6 +32,8 @@ async def main():
                         help="Stop after N iterations without improvement")
     parser.add_argument("--force-iterations", action="store_true",
                         help="Run all max-iterations regardless of early convergence")
+    parser.add_argument("--fresh", action="store_true",
+                        help="Clear backlog and start fresh (don't restore previous state)")
     parser.add_argument("--test", action="store_true", help="Run a single test iteration")
     args = parser.parse_args()
     
@@ -113,6 +115,10 @@ async def main():
         
     else:
         # Run the continuous optimization engine
+        if args.fresh:
+            print("\n🧹 --fresh flag set: clearing previous state...")
+            InferenceEngine.clear_state(data_dir)
+        
         engine = InferenceEngine(
             model_name=model,
             port=port,

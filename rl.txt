@@ -1,0 +1,84 @@
+ I'll summarize this for Kimi Code CLI implementation. Since I cannot generate files or directly access your VM, I'll provide a structured summary you can copy into a new Kimi Code CLI session.
+
+---
+
+## **RL-Based vLLM Config Tuner - Implementation Brief**
+
+### **Objective**
+Run a 2-day experiment to see how much RL can improve vLLM config over human baseline using GuideLLM metrics as reward signal.
+
+### **Key Design Decisions from Discussion**
+
+1. **Black-box approach**: No profiling, no SMEs. Just config → GuideLLM → reward → learn.
+2. **Single agent**: Not multiple parallel agents. Config space is too coupled (batch size affects quantization affects speculative decoding).
+3. **Thompson Sampling bandit**: Simple, sample-efficient, handles 2-minute iteration times well.
+4. **Fixed workload**: Same benchmark traffic for entire experiment (no adaptation, pure optimization).
+
+### **Environment Constraints**
+- Instance runs 24/7 (no cold start issues)
+- ~2 minutes per GuideLLM run (max_requests=100, target throughput)
+- ~720 episodes/day, ~1500 total over 2 days
+- Platform-agnostic (works on any cloud provider)
+
+### **Config Space (Discrete)**
+```python
+max_num_seqs: [64, 128, 256, 512, 1024]
+speculative: [False, True]
+draft_model: ['none', 'tinyllama']  # if speculative=True
+tp_size: [1, 2]  # adjust based on your GPU count
+quantization: ['none', 'fp8', 'int8']
+```
+Total: ~60 unique configs (5 × 2 × 2 × 3, with draft_model dependent)
+
+### **Reward Function**
+```python
+def calculate_reward(metrics, sla_targets):
+    if metrics['ttft_p99'] > sla_targets['ttft']:
+        return 0.0
+    if metrics['itl_p99'] > sla_targets['itl']:
+        return 0.0
+    if metrics['failed_requests'] > 0:
+        return 0.0
+    # Normalize throughput - adjust 100.0 based on observed range
+    return min(metrics['throughput'] / 100.0, 1.0)
+```
+
+### **Algorithm: Thompson Sampling**
+- Prior: Gaussian(mean=0.5, var=1.0) for each config
+- Select: Sample from posterior, pick highest
+- Update: Bayesian update with observed reward
+- Exploration: Natural via posterior uncertainty (no epsilon needed)
+
+### **Experiment Protocol**
+1. **Hour 0-1**: Run baseline config 30x to establish mean/variance
+2. **Hour 1-49**: RL exploration (Thompson Sampling)
+3. **Hour 49-51**: Validation - run best RL config 30x vs baseline 30x
+4. **Report**: (RL_best - Baseline) / Baseline as percentage gain
+
+### **Why This beats previous approach**
+- Previous: Profiling → SME diagnosis → manual config tuning (led to misdiagnosis like "increase batch size" when actual fix was speculative decoding)
+- This: Empirical gradient ascent, no human interpretation of profiler data
+- Previous attempt found 23% win manually; RL should match or exceed with systematic exploration
+
+### **Expected Outcome**
+- Convergence within 500-1000 episodes
+- 20-30% improvement over baseline if headroom exists
+- If no improvement: baseline was already optimal (valuable data)
+
+### **Files Needed**
+1. `config.py` - Config dataclass and space definition
+2. `agent.py` - Thompson Sampling implementation
+3. `reward.py` - Reward calculation from GuideLLM metrics
+4. `runner.py` - Main loop: select config → run GuideLLM → update → log
+5. `analyze.py` - Post-experiment analysis and visualization
+
+### **Key Implementation Notes**
+- Use `guidellm` CLI or Python API to run benchmarks
+- Log every episode: timestamp, config, metrics, reward, posterior mean/var
+- Handle OOM/crashes as reward=0 (Thompson Sampling will learn to avoid)
+- No need for experience replay or neural networks - 60 configs × 25 samples each = 1500 episodes for tight confidence intervals
+
+---
+
+
+

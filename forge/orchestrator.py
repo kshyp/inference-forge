@@ -546,7 +546,11 @@ class InferenceEngine:
                     
                     # Build collected_data for SME analysis
                     collected_data = {
-                        "vllm_logs": {"log_file": profile_result.get("log_file")},
+                        "vllm_logs": {
+                            "log_file": profile_result.get("log_file"),
+                            "config": {"model_name": self.model_name},
+                        },
+                        "system_metrics_report": profile_result.get("system_metrics", {}),
                     }
                     
                     # Analyze NSYS report if available
@@ -933,6 +937,11 @@ class InferenceEngine:
         experiment_id = str(uuid4())
         timestamp = datetime.now().isoformat()
         
+        # Check if using a quantized model
+        model_name = config.get("model", self.model_name)
+        if model_name != self.model_name:
+            print(f"\n🎯 Using quantized model: {model_name}")
+        
         print(f"\n{'='*80}")
         print(f"🔁 ITERATION {self.iteration} (Backlog execution)")
         print(f"{'='*80}")
@@ -949,7 +958,7 @@ class InferenceEngine:
                     type="benchmark",
                     payload={
                         "experiment_id": experiment_id,
-                        "model_name": self.model_name,
+                        "model_name": model_name,
                         "vllm_config": {
                             "port": self.port,
                             "startup_timeout_seconds": 300,
@@ -982,7 +991,7 @@ class InferenceEngine:
                     type="benchmark",
                     payload={
                         "experiment_id": experiment_id,
-                        "model_name": self.model_name,
+                        "model_name": model_name,
                         # No target_rate needed - benchmark agent uses fixed rate
                         "vllm_config": {
                             "port": self.port,
@@ -1012,7 +1021,7 @@ class InferenceEngine:
                     type="benchmark",
                     payload={
                         "experiment_id": experiment_id,
-                        "model_name": self.model_name,
+                        "model_name": model_name,
                         # No target_rate needed - benchmark agent uses fixed rate
                         "vllm_config": {
                             "port": self.port,
@@ -1092,6 +1101,31 @@ class InferenceEngine:
             new_config.pop(key, None)
         
         return new_config
+    
+    @staticmethod
+    def clear_state(data_dir: str) -> None:
+        """Clear saved optimization state to start fresh."""
+        data_path = Path(data_dir)
+        state_file = data_path / "optimization_state.json"
+        
+        if state_file.exists():
+            state_file.unlink()
+            print(f"   ✓ Removed state file: {state_file}")
+        
+        # Also clear experiment directories if they exist
+        experiments_dir = data_path / "experiments"
+        if experiments_dir.exists():
+            import shutil
+            shutil.rmtree(experiments_dir)
+            print(f"   ✓ Cleared experiments directory: {experiments_dir}")
+        
+        # Clear state database
+        state_db = data_path / "state.db"
+        if state_db.exists():
+            state_db.unlink()
+            print(f"   ✓ Removed state database: {state_db}")
+        
+        print("   🆕 Starting fresh - no previous state restored")
     
     def _restore_state(self) -> None:
         """Restore optimization state from disk if exists."""

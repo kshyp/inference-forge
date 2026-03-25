@@ -1,6 +1,7 @@
 """Scheduling SME - Optimizes batching and prefill scheduling with AI brain."""
 
 import json
+from pathlib import Path
 from typing import Dict, Any, Optional
 
 from .base import BaseSME, DataRequirement, ExperimentSuggestion, SMEResponse, RegistrationInfo
@@ -24,14 +25,39 @@ class SchedulingSME(BaseSME):
     - Scheduler policy (scheduler_delay_factor, policy type)
     - Request prioritization
     
-    Uses multi-LLM consensus to analyze scheduling inefficiencies and 
-    recommend configuration changes.
+    Self-Relevance Detection:
+    This SME scans data to determine if scheduling optimization is relevant:
+    - Low GPU utilization (< 60%)
+    - High queue depth or queue buildup
+    - High TTFT (time to first token)
+    - High TPOT variance
+    - Batch underutilization
     """
     
     # System prompt for scheduling analysis
-    SYSTEM_PROMPT = """You are a vLLM scheduling optimization expert.
+    SYSTEM_PROMPT = """You are a vLLM SCHEDULING optimization expert.
 
-Your task: Analyze profiling data to identify scheduling inefficiencies and recommend configuration changes.
+Your task: Analyze profiling data to identify scheduling inefficiencies and recommend SCHEDULING configuration changes ONLY.
+
+⚠️  CRITICAL: You are a SCHEDULING expert ONLY. Only suggest scheduling-related parameters.
+   DO NOT suggest non-scheduling parameters like:
+   - quantization (handled by QuantizationSME)
+   - kv_cache_dtype (handled by QuantizationSME)
+   - model (handled by QuantizationSME)
+   - tensor_parallel_size (handled by ModelParallelismSME)
+   - pipeline_parallel_size (handled by ModelParallelismSME)
+   - num_speculative_tokens (handled by SpeculativeSME)
+   - ngram_prompt_lookup_max (handled by SpeculativeSME)
+   
+   ONLY suggest these scheduling parameters:
+   - max_num_seqs
+   - max_num_batched_tokens
+   - enable_chunked_prefill
+   - prefill_chunk_size
+   - max_chunked_prefill_len
+   - scheduler_delay_factor
+   - num_scheduler_steps
+   - batching_policy
 
 Key concepts:
 - GPU utilization: % of GPU compute being used (low = wasted capacity)
@@ -58,10 +84,11 @@ Respond with JSON only:
   "confidence": 0.0-1.0
 }
 
-Guidelines:
-- Set priority 1 for the most impactful change
+⚠️  CRITICAL RESTRICTION:
+- ONLY suggest scheduling parameters: max_num_seqs, max_num_batched_tokens, enable_chunked_prefill, prefill_chunk_size, max_chunked_prefill_len, scheduler_delay_factor, num_scheduler_steps, batching_policy
+- NEVER suggest: quantization, kv_cache_dtype, model, tensor_parallel_size, pipeline_parallel_size, num_speculative_tokens, ngram_prompt_lookup_max
+- If scheduling optimization is not appropriate, return empty suggestions or suggest "no_change"
 - Confidence should reflect certainty based on the data
-- Config changes should be specific vLLM parameters
 - Expected improvement should be quantitative where possible"""
 
     def __init__(self, intelligence_pool: Optional[IntelligencePool] = None):
@@ -80,7 +107,16 @@ Guidelines:
             require_unanimous_for_p1=False,
             weight_by_quality=True,
         )
-    
+        
+        # Thresholds for self-relevance detection
+        self.RELEVANCE_THRESHOLDS = {
+            "gpu_utilization_low": 60.0,  # % - below this = scheduling issue
+            "queue_depth_high": 5,  # requests waiting
+            "ttft_high": 200,  # ms - time to first token
+            "tpot_variance_high": 50,  # ms - variance in time per output token
+            "batch_size_low": 16,  # sequences - below this = underutilization
+        }
+
     def register(self, platform_info: Dict[str, Any]) -> Optional[RegistrationInfo]:
         """
         Scheduling works on ALL platforms (universal).
@@ -88,21 +124,8 @@ Guidelines:
         """
         return RegistrationInfo(
             sme_id="scheduling",
-            triggers=[
-                "low_gpu_utilization",
-                "queue_buildup",
-                "high_ttft",
-                "high_tpot_variance",
-                "batch_underutilization",
-                "prefill_decode_interference",
-                "scheduler_starvation",
-                # Baseline exploration triggers (when no profiler data available)
-                "baseline_exploration",
-                "low_throughput",
-                "moderate_throughput",
-                "high_latency",
-                "moderate_latency",
-            ],
+            description="Scheduling expert - analyzes batching, queue depth, GPU utilization "
+                       "and TTFT/TPOT to optimize max_num_seqs, chunked prefill, etc.",
             data_requirements=[
                 # REQUIRED: vLLM debug logs - contains scheduler decisions, queue depth, batch sizes
                 DataRequirement(
@@ -173,7 +196,7 @@ Guidelines:
                         "power_draw_watts",
                     ]
                 ),
-                # REQUIRED: NCU to determine compute vs memory bound (optional, requires root)
+                # OPTIONAL: NCU to determine compute vs memory bound (optional, requires root)
                 DataRequirement(
                     data_type="ncu_report",
                     required=False,  # Changed to optional - system metrics can substitute
@@ -196,7 +219,98 @@ Guidelines:
             ]
         )
     
-    async def analyze(self, profiling_data: Dict[str, Any],
+    def scan_data(self, 
+                  profile_dir: Path,
+                  profiling_data: Dict[str, Any],
+                  benchmark_metrics: Dict[str, Any]) -> tuple[bool, float, str]:
+        """
+        Scan profiling data to determine if scheduling optimization is relevant.
+        
+        Scheduling is relevant when:
+        1. GPU utilization < 60% (underutilized GPU)
+        2. Queue depth > 5 (requests waiting)
+        3. TTFT > 200ms (slow first token - chunking could help)
+        4. TPOT variance > 50ms (prefill interfering with decode)
+        5. Batch size < 16 (underutilized batching)
+        
+        Args:
+            profile_dir: Path to directory containing profiling data files
+            profiling_data: Pre-loaded profiling data
+            benchmark_metrics: Benchmark results
+            
+        Returns:
+            Tuple of (is_relevant, relevance_score, reason)
+        """
+        relevance_signals = []
+        relevance_score = 0.0
+        
+        # Extract data
+        system_metrics = profiling_data.get("system_metrics_report", {})
+        vllm_logs = profiling_data.get("vllm_logs", {})
+        vllm_config = vllm_logs.get("config", {})
+        vllm_metrics = vllm_logs.get("metrics", {})
+        ncu_report = profiling_data.get("ncu_report", {})
+        
+        # Check 1: GPU utilization (low = scheduling issue)
+        gpu_util = system_metrics.get("gpu_utilization_percent", 100)
+        if gpu_util < self.RELEVANCE_THRESHOLDS["gpu_utilization_low"]:
+            relevance_signals.append(f"low_gpu_utilization ({gpu_util:.1f}%)")
+            relevance_score += 0.35
+        
+        # Check 2: Queue depth (high = scheduling backlog)
+        queue_depth = vllm_metrics.get("scheduler_queue_depth", 0)
+        if isinstance(queue_depth, list) and queue_depth:
+            queue_depth = max(queue_depth)
+        if queue_depth > self.RELEVANCE_THRESHOLDS["queue_depth_high"]:
+            relevance_signals.append(f"queue_buildup ({queue_depth} requests)")
+            relevance_score += 0.25
+        
+        # Check 3: TTFT (high = prefill too slow, chunking could help)
+        ttft_p99 = benchmark_metrics.get("ttft_p99", 0)
+        if isinstance(ttft_p99, dict):
+            ttft_p99 = ttft_p99.get("p99", 0)
+        if ttft_p99 > self.RELEVANCE_THRESHOLDS["ttft_high"]:
+            relevance_signals.append(f"high_ttft ({ttft_p99:.0f}ms p99)")
+            relevance_score += 0.2
+        
+        # Check 4: Current batch settings (might be suboptimal)
+        max_num_seqs = vllm_config.get("max_num_seqs", 256)
+        enable_chunked_prefill = vllm_config.get("enable_chunked_prefill", False)
+        
+        if max_num_seqs > 128 and gpu_util < 70:
+            relevance_signals.append(f"large_batch_low_utilization (max_num_seqs={max_num_seqs}, gpu={gpu_util:.1f}%)")
+            relevance_score += 0.1
+        
+        if not enable_chunked_prefill and ttft_p99 > 150:
+            relevance_signals.append(f"chunked_prefill_disabled_with_high_ttft")
+            relevance_score += 0.1
+        
+        # Check 5: Batch utilization from metrics
+        batch_size = vllm_metrics.get("scheduler_batch_size", 0)
+        if isinstance(batch_size, list) and batch_size:
+            avg_batch = sum(batch_size) / len(batch_size)
+            if avg_batch < self.RELEVANCE_THRESHOLDS["batch_size_low"]:
+                relevance_signals.append(f"batch_underutilization (avg={avg_batch:.1f})")
+                relevance_score += 0.15
+        
+        # Determine relevance
+        is_relevant = relevance_score >= 0.25  # At least 2 signals or strong signal needed
+        
+        if is_relevant:
+            reason = f"Scheduling optimization relevant: {'; '.join(relevance_signals)}"
+        else:
+            if relevance_signals:
+                reason = f"Weak relevance ({relevance_score:.2f}): {'; '.join(relevance_signals)}"
+            else:
+                reason = (f"No scheduling optimization signals detected "
+                         f"(GPU util={gpu_util:.1f}%, queue_depth={queue_depth}, "
+                         f"TTFT p99={ttft_p99:.0f}ms)")
+        
+        return is_relevant, min(relevance_score, 1.0), reason
+    
+    async def analyze(self,
+                      profile_dir: Path,
+                      profiling_data: Dict[str, Any],
                       benchmark_metrics: Dict[str, Any]) -> SMEResponse:
         """
         Analyze scheduling efficiency using multi-LLM consensus.
@@ -208,6 +322,7 @@ Guidelines:
         - Scheduler starvation → adjust delay factor
         
         Args:
+            profile_dir: Path to directory containing profiling data
             profiling_data: Collected profiler outputs (vllm_logs, ncu_report, etc.)
             benchmark_metrics: Benchmark results (TTFT, TPOT, throughput)
         
@@ -216,6 +331,24 @@ Guidelines:
         """
         import logging
         logger = logging.getLogger(__name__)
+        
+        # First, check relevance
+        is_relevant, relevance_score, relevance_reason = self.scan_data(
+            profile_dir, profiling_data, benchmark_metrics
+        )
+        
+        if not is_relevant:
+            return SMEResponse(
+                findings={
+                    "primary_bottleneck": "not_scheduling_related",
+                    "scheduling_candidate": False,
+                },
+                suggestions=[],
+                confidence=0.0,
+                is_relevant=False,
+                relevance_score=relevance_score,
+                relevance_reason=relevance_reason
+            )
         
         # 1. Prepare structured prompt with all data
         prompt = self._build_analysis_prompt(profiling_data, benchmark_metrics)
@@ -239,7 +372,10 @@ Guidelines:
             return SMEResponse(
                 findings={"error": "No LLM intelligence sources available"},
                 suggestions=[],
-                confidence=0.0
+                confidence=0.0,
+                is_relevant=True,
+                relevance_score=relevance_score,
+                relevance_reason=relevance_reason
             )
         
         # 3. Compute consensus across all model responses
@@ -274,7 +410,10 @@ Guidelines:
             },
             suggestions=suggestions,
             confidence=consensus_result.suggestions[0].weighted_confidence 
-                      if suggestions else 0.0
+                      if suggestions else 0.0,
+            is_relevant=True,
+            relevance_score=relevance_score,
+            relevance_reason=relevance_reason
         )
     
     def _build_analysis_prompt(
@@ -338,8 +477,6 @@ Respond with JSON only (no markdown, no explanations outside JSON)."""
             system=self.SYSTEM_PROMPT,
             user=user_content
         )
-    
-
     
     def _extract_primary_finding(self, consensus_result) -> str:
         """Extract primary bottleneck from consensus divergence report."""

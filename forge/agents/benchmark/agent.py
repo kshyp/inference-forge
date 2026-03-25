@@ -196,7 +196,8 @@ class BenchmarkAgent(BaseAgent):
             model_name=model_name,
             port=port,
             benchmark_dir=benchmark_dir,
-            task=task
+            task=task,
+            config_flags=config_flags,
         )
         
         # Build guidellm command for throughput run
@@ -369,22 +370,45 @@ class BenchmarkAgent(BaseAgent):
         port: int,
         benchmark_dir: Path,
         task: Task,
+        config_flags: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Start vLLM server."""
+        """Start vLLM server with configuration flags."""
         log_file = benchmark_dir / "vllm_server.log"
+        config_flags = config_flags or {}
         
-        # Check for start script
-        start_script = self.autotuner_dir / "start_vllm_server.sh"
+        # Build command with config flags
+        cmd = [
+            "python", "-m", "vllm.entrypoints.openai.api_server",
+            "--model", model_name,
+            "--port", str(port),
+        ]
         
-        if start_script.exists():
-            cmd = ["bash", str(start_script), model_name, str(port)]
-        else:
-            # Direct command
-            cmd = [
-                "python", "-m", "vllm.entrypoints.openai.api_server",
-                "--model", model_name,
-                "--port", str(port),
-            ]
+        # Add config flags
+        if "max_num_seqs" in config_flags:
+            cmd.extend(["--max-num-seqs", str(config_flags["max_num_seqs"])])
+        if "max_num_batched_tokens" in config_flags:
+            cmd.extend(["--max-num-batched-tokens", str(config_flags["max_num_batched_tokens"])])
+        if "gpu_memory_utilization" in config_flags:
+            cmd.extend(["--gpu-memory-utilization", str(config_flags["gpu_memory_utilization"])])
+        if "max_model_len" in config_flags:
+            cmd.extend(["--max-model-len", str(config_flags["max_model_len"])])
+        if config_flags.get("enable_chunked_prefill"):
+            cmd.append("--enable-chunked-prefill")
+        if "max_chunked_prefill_len" in config_flags:
+            cmd.extend(["--max-num-batched-tokens", str(config_flags["max_chunked_prefill_len"])])
+        if config_flags.get("enable_prefix_caching"):
+            cmd.append("--enable-prefix-caching")
+        if config_flags.get("speculative_model") == "ngram":
+            # Build speculative config JSON for vLLM 0.16.0+
+            spec_config = {
+                "method": "ngram",
+                "num_speculative_tokens": config_flags.get("num_lookahead_slots", 2),
+                "prompt_lookup_max": config_flags.get("ngram_prompt_lookup_max", 4),
+            }
+            import json
+            cmd.extend(["--speculative-config", json.dumps(spec_config)])
+        
+        print(f"   Starting vLLM: {' '.join(cmd)}")
         
         # Start process
         self.vllm_process = await asyncio.create_subprocess_exec(
@@ -399,7 +423,7 @@ class BenchmarkAgent(BaseAgent):
         await self.checkpoint(task.id)
         
         # Wait for server to be ready
-        await self._wait_for_vllm_ready(port, timeout=120)
+        await self._wait_for_vllm_ready(port, timeout=300)
     
     async def _wait_for_vllm_ready(self, port: int, timeout: float = 120) -> None:
         """Wait for vLLM server health endpoint."""

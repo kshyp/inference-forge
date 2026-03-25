@@ -39,6 +39,7 @@ data/profiles/
 data/test_*/
 data/*.db
 data/*.json
+data_rl/
 scripts/data/
 *.log
 

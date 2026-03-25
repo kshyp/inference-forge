@@ -3,10 +3,14 @@
 The "Brain" agent that:
 1. Discovers platform and registers SMEs
 2. Receives profiling results from ProfilerAgent
-3. Extracts signals from profiling data
-4. Consults relevant SMEs (using multi-LLM consensus)
+3. Makes ALL profiling data available to ALL SMEs in the profile directory
+4. Consults ALL SMEs - each SME determines its own relevance by scanning data
 5. Synthesizes recommendations into ranked experiment plan
 6. Hands off to BenchmarkAgent for next iteration
+
+NOTE: The Coordinator NO LONGER decides which SME gets triggered.
+All profiling data is stored in experiments/data/profile/{experiment_id}/
+and ALL SMEs have access to scan and analyze it themselves.
 """
 
 import asyncio
@@ -26,6 +30,7 @@ from forge.core.events import (
 )
 from forge.core.state import StateStore
 from forge.sme_registry import SMERegistry
+from forge.hardware import detect_hardware, HardwareCapabilities
 
 from .synthesis import ExperimentSynthesizer, SynthesisConfig
 
@@ -37,10 +42,14 @@ class CoordinatorAgent(BaseAgent):
     Workflow:
     1. Discover platform → Register SMEs
     2. Receive profiling data from ProfilerAgent
-    3. Extract signals (triage)
-    4. Consult relevant SMEs (async, parallel)
+    3. Store data in profile directory for ALL SMEs to access
+    4. Consult ALL SMEs - each SME scans data to determine relevance
     5. Synthesize recommendations → RankedExperiment list
     6. Hand off to BenchmarkAgent for next iteration
+    
+    NOTE: This is a data-driven architecture. The Coordinator does NOT
+    pre-filter SMEs. Each SME determines its own relevance by scanning
+    the profiling data in the profile directory.
     
     Attributes:
         sme_registry: Registry for SME management
@@ -64,6 +73,10 @@ class CoordinatorAgent(BaseAgent):
         
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Profile directory where all profiling data is stored
+        self.profile_dir = self.data_dir / "profile"
+        self.profile_dir.mkdir(parents=True, exist_ok=True)
         
         # Components
         self.sme_registry = SMERegistry()
@@ -107,6 +120,7 @@ class CoordinatorAgent(BaseAgent):
             "current_config": {...},  # Current vLLM config
             "iteration": 1,
             "parent_experiment_id": "uuid",
+            "profile_dir": "./data/profile/exp_123"  # Path to profiling data
         }
         """
         payload = task.payload
@@ -157,6 +171,7 @@ class CoordinatorAgent(BaseAgent):
         current_config = payload.get("current_config", {})
         iteration = payload.get("iteration", self.current_iteration + 1)
         parent_id = payload.get("parent_experiment_id")
+        profile_dir_override = payload.get("profile_dir")
         
         self.current_iteration = iteration
         
@@ -164,21 +179,34 @@ class CoordinatorAgent(BaseAgent):
         print(f"COORDINATOR ANALYSIS - Iteration {iteration}")
         print(f"{'='*70}")
         
-        # Step 1: Extract signals from profiling data
-        signals = self._extract_signals(profiling_result)
-        print(f"\n📊 Signals Detected: {signals}")
+        # Determine profile directory
+        if profile_dir_override:
+            profile_dir = Path(profile_dir_override)
+        elif parent_id:
+            profile_dir = self.profile_dir / str(parent_id)
+        else:
+            profile_dir = self.profile_dir / "default"
         
-        if not signals:
-            print("⚠️  No signals detected - running baseline exploration")
-            signals = ["baseline_exploration"]
+        # Ensure profile directory exists
+        profile_dir.mkdir(parents=True, exist_ok=True)
         
-        # Step 2: Extract profiling data for SMEs
+        print(f"\n📁 Profile directory: {profile_dir}")
+        
+        # Step 1: Extract profiling data for SMEs
         profiling_data = profiling_result.get("collected_data", {})
         benchmark_metrics = profiling_result.get("benchmark_metrics", {})
         
-        # Step 3: Consult SMEs
-        responses = await self.sme_registry.consult(
-            signals, profiling_data, benchmark_metrics
+        # Step 2: Add hardware capabilities to profiling data for all SMEs
+        if self.platform_info and "hardware_capabilities" in self.platform_info:
+            profiling_data["hardware_capabilities"] = self.platform_info["hardware_capabilities"]
+        
+        # Step 3: Save profiling data to disk for SMEs to access directly
+        self._save_profiling_data(profile_dir, profiling_data, benchmark_metrics)
+        
+        # Step 4: Consult ALL SMEs
+        # Each SME will scan the data to determine if it's relevant
+        responses, sme_ids = await self.sme_registry.consult(
+            profile_dir, profiling_data, benchmark_metrics
         )
         
         if not responses:
@@ -186,12 +214,10 @@ class CoordinatorAgent(BaseAgent):
             return {
                 "success": False,
                 "error": "No SME responses",
-                "signals": signals
+                "profile_dir": str(profile_dir)
             }
         
-        # Step 4: Synthesize into experiment plan
-        sme_ids = self.sme_registry.get_registered_sme_ids()
-        
+        # Step 5: Synthesize into experiment plan
         experiment_plan = self.synthesizer.synthesize(
             sme_responses=responses,
             sme_ids=sme_ids,
@@ -200,10 +226,10 @@ class CoordinatorAgent(BaseAgent):
             parent_experiment_id=parent_id
         )
         
-        # Step 5: Store result for handoff
+        # Step 6: Store result for handoff
         await self._result_queue.put(experiment_plan)
         
-        # Step 6: Save to disk
+        # Step 7: Save to disk
         plan_file = self._save_experiment_plan(experiment_plan)
         
         # Print summary
@@ -214,10 +240,10 @@ class CoordinatorAgent(BaseAgent):
             "experiment_plan": {
                 "iteration": experiment_plan.iteration,
                 "experiments_count": len(experiment_plan.experiments),
-                "signals": experiment_plan.signals_detected,
-                "smes": experiment_plan.smes_consulted,
+                "smes_consulted": experiment_plan.smes_consulted,
             },
             "plan_file": str(plan_file),
+            "profile_dir": str(profile_dir),
             "message": f"Generated {len(experiment_plan.experiments)} ranked experiments"
         }
     
@@ -226,106 +252,85 @@ class CoordinatorAgent(BaseAgent):
         return await self._action_analyze(task)
     
     def _discover_platform(self) -> Dict[str, Any]:
-        """Detect hardware platform."""
-        # In reality: run nvidia-smi, check /proc/cpuinfo, etc.
-        # For now: simulate single GPU CUDA
-        
+        """Detect hardware platform with full capabilities."""
         print("\n🔍 Discovering platform...")
         
-        platform = {
-            "type": "nvidia_cuda",
-            "gpu_model": "A100",
-            "gpu_count": 1,
-            "cuda_version": "12.2",
-            "driver_version": "535.104"
-        }
-        
-        print(f"   Platform: {platform['type']}")
-        print(f"   GPUs: {platform['gpu_count']}x {platform['gpu_model']}")
+        try:
+            # Use hardware detector for comprehensive detection
+            caps = detect_hardware()
+            
+            platform = {
+                "type": "nvidia_cuda" if caps.gpu_count > 0 else "cpu",
+                "gpu_model": caps.gpu_model,
+                "gpu_count": caps.gpu_count,
+                "cuda_version": caps.cuda_version,
+                "driver_version": caps.driver_version,
+                "hardware_capabilities": caps.to_dict(),
+            }
+            
+            print(f"   Platform: {platform['type']}")
+            print(f"   GPUs: {platform['gpu_count']}x {platform['gpu_model']}")
+            print(f"   Architecture: {caps.gpu_architecture.value}")
+            print(f"   VRAM: {caps.vram_gb:.1f} GB")
+            print(f"   Native precisions: {', '.join(sorted(caps.native_precisions))}")
+            print(f"   Quantization support: {', '.join(caps.recommended_weight_quant[:2])}")
+            
+        except Exception as e:
+            print(f"   ⚠️ Hardware detection failed: {e}")
+            print("   Using fallback platform detection")
+            
+            # Fallback to basic detection
+            platform = {
+                "type": "nvidia_cuda",
+                "gpu_model": "A100",
+                "gpu_count": 1,
+                "cuda_version": "12.2",
+                "driver_version": "535.104",
+                "hardware_capabilities": {},
+            }
+            
+            print(f"   Platform: {platform['type']}")
+            print(f"   GPUs: {platform['gpu_count']}x {platform['gpu_model']}")
         
         return platform
     
-    def _extract_signals(self, profiling_result: Dict[str, Any]) -> List[str]:
-        """
-        Extract bottleneck signals from profiling data.
+    def _save_profiling_data(self, 
+                             profile_dir: Path, 
+                             profiling_data: Dict[str, Any],
+                             benchmark_metrics: Dict[str, Any]) -> None:
+        """Save profiling data to disk for SMEs to access directly."""
+        # Save collected data
+        data_file = profile_dir / "profiling_data.json"
+        with open(data_file, "w") as f:
+            json.dump(profiling_data, f, indent=2, default=str)
         
-        This is rule-based triage. Could be enhanced with LLM-based triage.
-        """
-        signals = []
+        # Save benchmark metrics
+        metrics_file = profile_dir / "benchmark_metrics.json"
+        with open(metrics_file, "w") as f:
+            json.dump(benchmark_metrics, f, indent=2, default=str)
         
-        # Extract data from result
-        collected = profiling_result.get("collected_data", {})
-        ncu = collected.get("ncu_report", {})
-        vllm = collected.get("vllm_logs", {})
-        benchmark = profiling_result.get("benchmark_metrics", {})
+        # Also save individual data components if they exist
+        if "vllm_logs" in profiling_data:
+            vllm_file = profile_dir / "vllm_logs.json"
+            with open(vllm_file, "w") as f:
+                json.dump(profiling_data["vllm_logs"], f, indent=2, default=str)
         
-        # Check if we have any actual data or just baseline
-        has_profiler_data = bool(ncu or vllm)
+        if "nsys_report" in profiling_data:
+            nsys_file = profile_dir / "nsys_report.json"
+            with open(nsys_file, "w") as f:
+                json.dump(profiling_data["nsys_report"], f, indent=2, default=str)
         
-        if not has_profiler_data:
-            # No profiler data - use baseline exploration signals
-            # These will trigger all SMEs to provide recommendations
-            throughput = benchmark.get("throughput", 0)
-            latency = benchmark.get("latency_p99", 0)
-            
-            # Always add baseline exploration if no profiler data
-            signals.append("baseline_exploration")
-            
-            # Add throughput-based signals
-            if throughput > 0:
-                if throughput < 30:
-                    signals.append("low_throughput")
-                elif throughput < 50:
-                    signals.append("moderate_throughput")
-                
-                # Latency-based signals
-                if latency > 1000:
-                    signals.append("high_latency")
-                elif latency > 500:
-                    signals.append("moderate_latency")
-            
-            return signals
+        if "ncu_report" in profiling_data:
+            ncu_file = profile_dir / "ncu_report.json"
+            with open(ncu_file, "w") as f:
+                json.dump(profiling_data["ncu_report"], f, indent=2, default=str)
         
-        # GPU utilization check (from NCU)
-        gpu_util = ncu.get("compute_utilization_percent", 100)
-        if gpu_util < 50:
-            signals.append("low_gpu_utilization")
-        elif gpu_util < 70:
-            signals.append("moderate_gpu_utilization")
+        if "system_metrics_report" in profiling_data:
+            sys_file = profile_dir / "system_metrics.json"
+            with open(sys_file, "w") as f:
+                json.dump(profiling_data["system_metrics_report"], f, indent=2, default=str)
         
-        # Memory bandwidth check
-        mem_bw = ncu.get("memory_bandwidth_utilization_percent", 0)
-        if mem_bw > 80:
-            signals.append("memory_bandwidth_bound")
-        
-        # Queue depth check
-        queue_depth = vllm.get("scheduler_queue_depth", 0)
-        if isinstance(queue_depth, list) and queue_depth:
-            max_queue = max(queue_depth)
-            if max_queue > 10:
-                signals.append("queue_buildup")
-        elif isinstance(queue_depth, (int, float)) and queue_depth > 10:
-            signals.append("queue_buildup")
-        
-        # KV cache pressure
-        kv_usage = vllm.get("kv_cache_usage_percent", 0)
-        if kv_usage > 85:
-            signals.append("kv_cache_pressure")
-        
-        # Latency checks from benchmark
-        ttft_p99 = benchmark.get("ttft_p99", 0)
-        if isinstance(ttft_p99, dict):
-            ttft_p99 = ttft_p99.get("p99", 0)
-        if ttft_p99 > 500:
-            signals.append("high_ttft")
-        
-        tpot_p99 = benchmark.get("tpot_p99", 0)
-        if isinstance(tpot_p99, dict):
-            tpot_p99 = tpot_p99.get("p99", 0)
-        if tpot_p99 > 100:
-            signals.append("high_tpot")
-        
-        return signals
+        print(f"   💾 Saved profiling data to {profile_dir}")
     
     def _save_experiment_plan(self, plan: ExperimentPlan) -> Path:
         """Save experiment plan to disk."""
@@ -366,7 +371,6 @@ class CoordinatorAgent(BaseAgent):
         """Print experiment plan summary."""
         print(f"\n📋 EXPERIMENT PLAN - Iteration {plan.iteration}")
         print(f"{'='*70}")
-        print(f"Signals: {', '.join(plan.signals_detected)}")
         print(f"SMEs Consulted: {', '.join(plan.smes_consulted)}")
         print(f"\nRanked Experiments ({len(plan.experiments)}):")
         

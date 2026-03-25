@@ -9,7 +9,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from .base import BaseProfiler, ProfilingContext, ProfilerResult
+from .base import BaseProfiler, ProfilingContext, ProfilerResult, RawProfilerOutput
 
 
 class SystemMetricsCollector(BaseProfiler):
@@ -76,8 +76,14 @@ class SystemMetricsCollector(BaseProfiler):
                 return ProfilerResult(
                     success=False,
                     data_type=self.DATA_TYPE,
-                    profiler_name=self.PROFILER_NAME,
-                    error=f"nvidia-smi failed: {result.stderr}"
+                    extractors={},
+                    raw_output=RawProfilerOutput(
+                        report_path=None,
+                        stdout=result.stdout,
+                        stderr=result.stderr,
+                        metadata={"profiler_name": self.PROFILER_NAME}
+                    ),
+                    error_message=f"nvidia-smi failed: {result.stderr}"
                 )
             
             # Parse output
@@ -115,17 +121,27 @@ class SystemMetricsCollector(BaseProfiler):
             return ProfilerResult(
                 success=True,
                 data_type=self.DATA_TYPE,
-                profiler_name=self.PROFILER_NAME,
-                output_path=output_file,
-                metrics=aggregated
+                extractors=aggregated,
+                raw_output=RawProfilerOutput(
+                    report_path=output_file,
+                    stdout="System metrics collected",
+                    stderr="",
+                    metadata={"profiler_name": self.PROFILER_NAME}
+                )
             )
             
         except Exception as e:
             return ProfilerResult(
                 success=False,
                 data_type=self.DATA_TYPE,
-                profiler_name=self.PROFILER_NAME,
-                error=str(e)
+                extractors={},
+                raw_output=RawProfilerOutput(
+                    report_path=None,
+                    stdout="",
+                    stderr=str(e),
+                    metadata={"profiler_name": self.PROFILER_NAME}
+                ),
+                error_message=str(e)
             )
     
     def _aggregate_metrics(self, per_gpu: list) -> Dict[str, Any]:

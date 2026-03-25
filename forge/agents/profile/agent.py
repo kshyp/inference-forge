@@ -20,6 +20,7 @@ from uuid import UUID
 from forge.agents.base import BaseAgent
 from forge.core.events import Task
 from forge.core.state import StateStore
+from .profilers.base import ProfilingContext
 
 
 class ProfilerAgent(BaseAgent):
@@ -108,6 +109,22 @@ class ProfilerAgent(BaseAgent):
             print(f"🛑 Stopping vLLM...")
             await self._stop_vllm()
             
+            # Collect system metrics
+            print(f"   Collecting system metrics...")
+            from .profilers.system_metrics import SystemMetricsCollector
+            metrics_collector = SystemMetricsCollector()
+            
+            system_metrics_result = await metrics_collector.run(
+                ProfilingContext(output_dir=profile_dir, experiment_id=experiment_id)
+            )
+            
+            if system_metrics_result.success:
+                print(f"   ✓ System metrics collected")
+                system_metrics = system_metrics_result.extractors
+            else:
+                print(f"   ⚠️  System metrics failed: {system_metrics_result.error_message}")
+                system_metrics = {}
+            
             # Check results
             nsys_exists = nsys_report.exists()
             if enable_nsys:
@@ -122,6 +139,7 @@ class ProfilerAgent(BaseAgent):
                 "log_file": str(log_file),
                 "nsys_report": str(nsys_report) if nsys_exists else None,
                 "profile_dir": str(profile_dir),
+                "system_metrics": system_metrics,
             }
             
         except Exception as e:

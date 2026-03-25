@@ -75,7 +75,7 @@ class ExperimentSynthesizer:
     Synthesizes experiment recommendations from multiple SME responses.
     
     Algorithm:
-    1. Collect all suggestions from all SMEs
+    1. Collect all suggestions from all RELEVANT SMEs (filter out non-relevant)
     2. Group/merge similar suggestions by config_changes similarity
     3. Score each merged experiment:
        - SME confidence (weighted by model quality if available)
@@ -84,6 +84,9 @@ class ExperimentSynthesizer:
     4. Rank and select top N experiments
     5. Detect conflicts between experiments
     6. Generate ExperimentPlan
+    
+    NOTE: SMEs now determine their own relevance via scan_data().
+    The synthesizer filters out responses where is_relevant=False.
     """
     
     def __init__(self, config: Optional[SynthesisConfig] = None):
@@ -112,19 +115,37 @@ class ExperimentSynthesizer:
         """
         logger.info(f"Synthesizing {len(sme_responses)} SME responses")
         
-        # Step 1: Collect all suggestions
-        all_suggestions = []
+        # Step 1: Filter to only relevant SMEs and collect suggestions
+        relevant_responses = []
+        relevant_sme_ids = []
+        non_relevant_smes = []
+        
         for sme_id, response in zip(sme_ids, sme_responses):
+            if response.is_relevant:
+                relevant_responses.append(response)
+                relevant_sme_ids.append(sme_id)
+            else:
+                non_relevant_smes.append((sme_id, response.relevance_reason))
+                logger.info(f"Filtering out non-relevant SME: {sme_id} - {response.relevance_reason}")
+        
+        if non_relevant_smes:
+            print(f"\n[SYNT] Filtered out {len(non_relevant_smes)} non-relevant SME(s):")
+            for sme_id, reason in non_relevant_smes:
+                print(f"   - {sme_id}: {reason}")
+        
+        # Step 2: Collect all suggestions from relevant SMEs
+        all_suggestions = []
+        for sme_id, response in zip(relevant_sme_ids, relevant_responses):
             for suggestion in response.suggestions:
                 all_suggestions.append((sme_id, suggestion))
         
-        logger.info(f"Total suggestions: {len(all_suggestions)}")
+        logger.info(f"Total suggestions from relevant SMEs: {len(all_suggestions)}")
         
         if not all_suggestions:
             logger.warning("No suggestions to synthesize")
-            return self._create_empty_plan(iteration, parent_experiment_id)
+            return self._create_empty_plan(iteration, parent_experiment_id, non_relevant_smes)
         
-        # Step 2: Include ALL suggestions (don't filter by confidence or agreement)
+        # Step 3: Include ALL suggestions (don't filter by confidence or agreement)
         # We want to rank ALL candidates and try them before re-consulting SMEs.
         # The ranking will prioritize:
         #   1. High consensus (multiple SMEs agreeing) first
@@ -138,7 +159,7 @@ class ExperimentSynthesizer:
         
         logger.info(f"Total candidates for ranking: {len(filtered)}")
         
-        # Step 3: Merge similar suggestions
+        # Step 4: Merge similar suggestions
         if self.config.merge_similar:
             merged = self._merge_suggestions(filtered)
         else:
@@ -168,40 +189,37 @@ class ExperimentSynthesizer:
                 for sme_id, sug in all_suggestions
             ]
         
-        # Step 4: Score and rank
+        # Step 5: Score and rank
         scored = self._score_experiments(merged)
         
-        # Step 5: Select top N (or ALL if max_experiments is None/0)
+        # Step 6: Select top N (or ALL if max_experiments is None/0)
         if self.config.max_experiments:
             top_experiments = scored[:self.config.max_experiments]
         else:
             # Include ALL experiments - exhaust the backlog before re-consulting SMEs
             top_experiments = scored
         
-        # Step 6: Detect conflicts
+        # Step 7: Detect conflicts
         conflicts = self._detect_conflicts(top_experiments)
         if conflicts:
             logger.warning(f"Detected {len(conflicts)} conflicts between experiments")
         
-        # Step 7: Create ranked experiments
+        # Step 8: Create ranked experiments
         ranked = self._create_ranked_experiments(
             top_experiments, 
             current_config,
             iteration
         )
         
-        # Step 8: Build synthesis reasoning
-        reasoning = self._build_reasoning(sme_responses, sme_ids, ranked)
+        # Step 9: Build synthesis reasoning
+        reasoning = self._build_reasoning(relevant_responses, relevant_sme_ids, ranked, non_relevant_smes)
         
         return ExperimentPlan(
             iteration=iteration,
             parent_experiment_id=parent_experiment_id,
             experiments=ranked,
-            signals_detected=list(set(
-                sig for resp in sme_responses 
-                for sig in resp.findings.get("triggers", [])
-            )),
-            smes_consulted=sme_ids,
+            signals_detected=self._extract_signals_from_findings(relevant_responses),
+            smes_consulted=relevant_sme_ids,
             synthesis_reasoning=reasoning
         )
     
@@ -413,19 +431,25 @@ class ExperimentSynthesizer:
         self,
         sme_responses: List[SMEResponse],
         sme_ids: List[str],
-        ranked_experiments: List[RankedExperiment]
+        ranked_experiments: List[RankedExperiment],
+        non_relevant_smes: List[Tuple[str, str]]
     ) -> str:
         """Build human-readable synthesis reasoning."""
         lines = [
-            f"Synthesized {len(ranked_experiments)} experiments from {len(sme_ids)} SMEs.",
+            f"Synthesized {len(ranked_experiments)} experiments from {len(sme_ids)} relevant SMEs.",
             "",
-            "SME Findings:"
+            "Relevant SME Findings:"
         ]
         
         for sme_id, response in zip(sme_ids, sme_responses):
             findings = response.findings
             bottleneck = findings.get('primary_bottleneck', 'unknown')
-            lines.append(f"  - {sme_id}: {bottleneck} (confidence: {response.confidence:.2f})")
+            lines.append(f"  - {sme_id}: {bottleneck} (confidence: {response.confidence:.2f}, relevance: {response.relevance_score:.2f})")
+        
+        if non_relevant_smes:
+            lines.extend(["", "Non-Relevant SMEs (filtered out):"])
+            for sme_id, reason in non_relevant_smes:
+                lines.append(f"  - {sme_id}: {reason}")
         
         lines.extend(["", "Ranked Experiments:"])
         
@@ -440,16 +464,36 @@ class ExperimentSynthesizer:
     def _create_empty_plan(
         self, 
         iteration: int, 
-        parent_experiment_id: Optional[str]
+        parent_experiment_id: Optional[str],
+        non_relevant_smes: Optional[List[Tuple[str, str]]] = None
     ) -> ExperimentPlan:
         """Create an empty plan when no suggestions available."""
+        reasoning = "No suggestions from SMEs."
+        if non_relevant_smes:
+            reasoning += f" All {len(non_relevant_smes)} SMEs determined the data was not relevant to their expertise."
+        reasoning += " Consider baseline exploration."
+        
         return ExperimentPlan(
             iteration=iteration,
             parent_experiment_id=parent_experiment_id,
             experiments=[],
             signals_detected=[],
             smes_consulted=[],
-            synthesis_reasoning="No suggestions from SMEs. Consider baseline exploration."
+            synthesis_reasoning=reasoning
         )
     
-
+    def _extract_signals_from_findings(self, sme_responses: List[SMEResponse]) -> List[str]:
+        """Extract signals from SME findings for backwards compatibility."""
+        signals = set()
+        for response in sme_responses:
+            # Get primary bottleneck as signal
+            bottleneck = response.findings.get("primary_bottleneck", "")
+            if bottleneck and bottleneck != "unknown":
+                signals.add(bottleneck)
+            
+            # Get any other trigger signals from findings
+            triggers = response.findings.get("triggers", [])
+            for trigger in triggers:
+                signals.add(trigger)
+        
+        return list(signals)

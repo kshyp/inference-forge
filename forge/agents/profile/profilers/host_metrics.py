@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .base import BaseProfiler, ProfilingContext, ProfilerResult
+from .base import BaseProfiler, ProfilingContext, ProfilerResult, RawProfilerOutput
 
 
 class VMStatCollector(BaseProfiler):
@@ -58,8 +58,14 @@ class VMStatCollector(BaseProfiler):
                 return ProfilerResult(
                     success=False,
                     data_type=self.DATA_TYPE,
-                    profiler_name=self.PROFILER_NAME,
-                    error=f"vmstat failed: {result.stderr}"
+                    extractors={},
+                    raw_output=RawProfilerOutput(
+                        report_path=None,
+                        stdout=result.stdout,
+                        stderr=result.stderr,
+                        metadata={"profiler_name": self.PROFILER_NAME}
+                    ),
+                    error_message=f"vmstat failed: {result.stderr}"
                 )
             
             # Parse vmstat output
@@ -132,24 +138,40 @@ class VMStatCollector(BaseProfiler):
                 return ProfilerResult(
                     success=True,
                     data_type=self.DATA_TYPE,
-                    profiler_name=self.PROFILER_NAME,
-                    output_path=output_file,
-                    metrics=metrics
+                    extractors=metrics,
+                    raw_output=RawProfilerOutput(
+                        report_path=output_file,
+                        stdout="",
+                        stderr="",
+                        metadata={"profiler_name": self.PROFILER_NAME}
+                    )
                 )
             
             return ProfilerResult(
                 success=False,
                 data_type=self.DATA_TYPE,
-                profiler_name=self.PROFILER_NAME,
-                error="No vmstat samples collected"
+                extractors={},
+                raw_output=RawProfilerOutput(
+                    report_path=None,
+                    stdout="",
+                    stderr="No vmstat samples collected",
+                    metadata={"profiler_name": self.PROFILER_NAME}
+                ),
+                error_message="No vmstat samples collected"
             )
             
         except Exception as e:
             return ProfilerResult(
                 success=False,
                 data_type=self.DATA_TYPE,
-                profiler_name=self.PROFILER_NAME,
-                error=str(e)
+                extractors={},
+                raw_output=RawProfilerOutput(
+                    report_path=None,
+                    stdout="",
+                    stderr=str(e),
+                    metadata={"profiler_name": self.PROFILER_NAME}
+                ),
+                error_message=str(e)
             )
     
     async def extract(self, raw_output: Path) -> Dict[str, Any]:
@@ -200,8 +222,14 @@ class MPStatCollector(BaseProfiler):
                 return ProfilerResult(
                     success=False,
                     data_type=self.DATA_TYPE,
-                    profiler_name=self.PROFILER_NAME,
-                    error=f"mpstat failed: {result.stderr}"
+                    extractors={},
+                    raw_output=RawProfilerOutput(
+                        report_path=None,
+                        stdout=result.stdout,
+                        stderr=result.stderr,
+                        metadata={"profiler_name": self.PROFILER_NAME}
+                    ),
+                    error_message=f"mpstat failed: {result.stderr}"
                 )
             
             # Parse mpstat output
@@ -261,24 +289,40 @@ class MPStatCollector(BaseProfiler):
                 return ProfilerResult(
                     success=True,
                     data_type=self.DATA_TYPE,
-                    profiler_name=self.PROFILER_NAME,
-                    output_path=output_file,
-                    metrics=aggregated
+                    extractors=aggregated,
+                    raw_output=RawProfilerOutput(
+                        report_path=output_file,
+                        stdout="",
+                        stderr="",
+                        metadata={"profiler_name": self.PROFILER_NAME}
+                    )
                 )
             
             return ProfilerResult(
                 success=False,
                 data_type=self.DATA_TYPE,
-                profiler_name=self.PROFILER_NAME,
-                error="No mpstat samples collected"
+                extractors={},
+                raw_output=RawProfilerOutput(
+                    report_path=None,
+                    stdout="",
+                    stderr="No mpstat data collected",
+                    metadata={"profiler_name": self.PROFILER_NAME}
+                ),
+                error_message="No mpstat data collected"
             )
             
         except Exception as e:
             return ProfilerResult(
                 success=False,
                 data_type=self.DATA_TYPE,
-                profiler_name=self.PROFILER_NAME,
-                error=str(e)
+                extractors={},
+                raw_output=RawProfilerOutput(
+                    report_path=None,
+                    stdout="",
+                    stderr=str(e),
+                    metadata={"profiler_name": self.PROFILER_NAME}
+                ),
+                error_message=str(e)
             )
     
     async def extract(self, raw_output: Path) -> Dict[str, Any]:
